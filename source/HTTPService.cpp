@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <fstream>
 #include <libgen.h>
 #include <pwd.h>
@@ -7,6 +8,7 @@
 #include <unistd.h>
 #include "HTTPService.h"
 #include "ProgException.h"
+#include "toolkits/S3Tk.h"
 #include "toolkits/SystemTk.h"
 #include "workers/RemoteWorker.h"
 
@@ -28,6 +30,8 @@ void HTTPService::startServer()
 
 	if(!progArgs.getRunServiceInForeground() )
 		daemonize(); // daemonize process in background
+
+	S3Tk::initS3Global(progArgs); // inits threads and thus after service daemonize
 
 	// prepare http server and its URLs
 
@@ -185,6 +189,8 @@ void HTTPService::defineServerResources(HttpServer& server)
 
 			statistics.printPhaseResults(); // show results when running in foreground
 
+			std::cout << std::endl;
+
 			response->write(stream);
 		}
 		catch(const std::exception& e)
@@ -236,6 +242,14 @@ void HTTPService::defineServerResources(HttpServer& server)
 			std::string path = SERVICE_UPLOAD_BASEPATH(servicePort) + "/" + filename;
 
 			free(filenameDup);
+
+			// print file transfer phase to log
+
+			std::time_t currentTime = std::time(NULL);
+
+			std::cout << "Receiving tree file from master... "
+				"(ISO DATE: " << std::put_time(std::localtime(&currentTime), "%FT%T%z") << ")" <<
+				std::endl;
 
 			// prepare our upload directory
 
@@ -302,6 +316,14 @@ void HTTPService::defineServerResources(HttpServer& server)
 					"Service version: " HTTP_PROTOCOLVERSION "; "
 					"Received master version: " + masterProtoVer);
 
+			// print prep phase to log
+
+			std::time_t currentTime = std::time(NULL);
+
+			std::cout << "Preparing new benchmark phase... "
+				"(ISO DATE: " << std::put_time(std::localtime(&currentTime), "%FT%T%z") << ")" <<
+				std::endl;
+
 			// read config values as json
 
 			bpt::ptree recvTree;
@@ -322,6 +344,13 @@ void HTTPService::defineServerResources(HttpServer& server)
 			progArgs.setFromPropertyTreeForService(recvTree);
 
 			workerManager.prepareThreads();
+
+			// print user-defined label
+
+			if(!progArgs.getBenchLabel().empty() )
+				std::cout << "LABEL: " << progArgs.getBenchLabel() << std::endl;
+
+			std::cout << std::endl; // blank line after iso date & label
 
 			// prepare response
 
@@ -463,7 +492,17 @@ void HTTPService::defineServerResources(HttpServer& server)
  */
 void HTTPService::daemonize()
 {
-	std::string logfile = std::string(SERVICE_LOG_DIR) + "/" + SERVICE_LOG_FILEPREFIX + "_" +
+	std::string logfile;
+
+	if(getenv("TMP") != NULL)
+		logfile = getenv("TMP"); // default for linux
+	else
+	if(getenv("TEMP") != NULL)
+		logfile = getenv("TEMP"); // default for windows
+	else
+		logfile = SERVICE_LOG_DIR;
+
+	logfile += std::string("/") + SERVICE_LOG_FILEPREFIX + "_" +
 		SystemTk::getUsername() + "_" +
 		"p" + std::to_string(progArgs.getServicePort() ) + "." // port
 		"log";
