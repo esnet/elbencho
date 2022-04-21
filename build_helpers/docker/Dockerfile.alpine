@@ -7,7 +7,7 @@ FROM alpine:3 as builder
 RUN apk add bash boost-dev cmake curl-dev gcc g++ git libaio-dev libexecinfo-dev make \
         numactl-dev ncurses ncurses-dev sudo
 
-RUN cd /root && git clone https://github.com/breuner/elbencho.git && \
+RUN cd /root && git clone https://github.com/esnet/elbencho.git && \
     cd elbencho && \
     make LDFLAGS_EXTRA="-lexecinfo" S3_SUPPORT=1 USE_MIMALLOC=1 -j "$(nproc)" && \
     make install
