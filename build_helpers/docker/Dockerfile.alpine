@@ -15,9 +15,10 @@ RUN cd /root && git clone https://github.com/breuner/elbencho.git && \
 FROM alpine:3
 
 COPY --from=builder /usr/local/bin/elbencho /usr/local/bin
+COPY --from=builder /root/elbencho/contrib/storage_sweep /usr/local/bin
 
 RUN apk add boost-regex boost-program_options libaio libcurl libexecinfo libstdc++ ncurses \
-        numactl && \
+        numactl bash gnuplot && \
     ln -s /usr/local/bin/elbencho /usr/bin/elbencho && \
     /usr/local/bin/elbencho --version
 
