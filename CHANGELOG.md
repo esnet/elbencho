@@ -1,6 +1,15 @@
 # Changelog of elbencho
 
-## v2.1.0 (work in progress)
+## v2.1.3 (Apr 14, 2022)
+
+### Fixes
+* Fixed a problem that could lead to the csv header line of the "--csvfile" being printed for every run, not only once at the top.
+* Fixed a problem when "--blockvarpct" values other than "0" or "100" were selected together with the default "--blockvaralgo fast".
+
+### Contributors
+* Thanks to Glenn K. Lockwood and Daniel Drozdowski for reporting an issue.
+
+## v2.1.1 (Apr 10, 2022)
 
 ### New Features & Enhancements
 * New support for Windows
@@ -10,16 +19,21 @@
 * New option "--livecsv" to log live statistics to csv file. This can be used e.g. to see performance drops within a benchmark phase.
   * New option "--livecsvex" to see individual worker/service results instead of only aggregate results.
   * New option "--liveint" can be used to set the interval for live statistics update in milliseconds.
+* New elbencho-chart tool option for custom line colors ("--linecolors").
+* When given path is a directory or bucket, option -n/--dirs accepts 0 (zero) now to place files directly in the given dir/bucket instead of using subdirs.
+* Service instances now accept "--s3endpoint" argument to specify different S3 endpoints for each service.
 
 ### General Changes
 * Added check for S3 multi-part uploads that would exceed 10,000 parts per object to warn user early.
 * Old option "--refresh" has been renamed to "--liveint".
+* Updated to latest AWS SDK CPP v1.9.228.
+* Don't treat existing S3 buckets as error. Previously, existing S3 buckets were treated as error for the "-d" option if they were not owned by the current user.
 
 ### Fixes
 * Init AWS SDK after daemonizing into background in service mode to not prevent shutdown of static builds.
 
 ### Contributors
-* Thanks to Dima Kaputkin and Jeff Johnson for helpful comments and suggestions.
+* Thanks to Dima Kaputkin, Jeff Johnson, Greg Kemp and Shafay Latif for helpful comments and suggestions.
 
 ## v2.0.9 (Jan 24, 2022)
 

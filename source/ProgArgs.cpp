@@ -585,6 +585,13 @@ void ProgArgs::initImplicitValues()
 		useGDSBufReg = true;
 	}
 
+	if(!s3EndpointsStr.empty() && runAsService)
+	{
+		LOGGER(Log_NORMAL, "NOTE: S3 endpoints given. These will be used instead of any endpoints "
+			"provided by master." << std::endl);
+		s3EndpointsServiceOverrideStr = s3EndpointsStr;
+	}
+
 	benchLabelNoCommas = benchLabel;
 	std::replace(benchLabelNoCommas.begin(), benchLabelNoCommas.end(), ',', ' ');
 }
@@ -818,7 +825,7 @@ void ProgArgs::checkPathDependentArgs()
 			randomAmount = fileSize * benchPathsVec.size();
 		else
 		if( (benchPathType == BenchPathType_DIR) && !s3EndpointsVec.empty() && useS3RandObjSelect)
-			randomAmount = fileSize * numDirs * numFiles * numDataSetThreads;
+			randomAmount = fileSize * (numDirs ? numDirs : 1) * numFiles * numDataSetThreads;
 	}
 
 	if(useDirectIO && fileSize && (runCreateFilesPhase || runReadPhase) )
@@ -1135,9 +1142,6 @@ void ProgArgs::prepareBenchPathFDsVec()
 		if( (benchPathType == BenchPathType_BLOCKDEV) && runDeleteFilesPhase)
 			throw ProgException("File delete option is not allowed if benchmark path is a block "
 				"device.");
-
-		if( (benchPathType == BenchPathType_DIR) && !numDirs)
-			throw ProgException("Number of directories may not be zero");
 
 		int fd;
 		int openFlags = 0;
@@ -1595,6 +1599,9 @@ void ProgArgs::parseS3Endpoints()
 
 	if(s3EndpointsStr.empty() )
 		return; // nothing to do
+
+	if(!s3EndpointsServiceOverrideStr.empty() && runAsService)
+		s3EndpointsStr = s3EndpointsServiceOverrideStr; // user specified override for service
 
 	boost::split(s3EndpointsVec, s3EndpointsStr, boost::is_any_of(S3ENDPOINTS_DELIMITERS),
 		boost::token_compress_on);

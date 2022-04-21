@@ -1456,8 +1456,8 @@ void LocalWorker::preWriteBufRandRefill(char* buf, size_t bufLen, off_t fileOffs
 	if(!constFillRemainderLen)
 		return;
 
-	// fill constant (i.e. non variable) remainder of buffer
-	// note: rand algo is used to not always have the same remainder and defeat dedupe
+	// fill remainder of buffer with same 64bit value
+	// note: rand algo is used to defeat simple dedupe across remainders of different blocks
 	bufFill(&buf[varFillLen], randBlockVarAlgo->next(), constFillRemainderLen);
 }
 
@@ -1507,15 +1507,18 @@ void LocalWorker::preWriteBufRandRefillFast(char* buf, size_t bufLen, off_t file
 		state >>= 3;
 		uint64_t randUint64 = state;
 
-		memcpy(buf, &randUint64, bufLen - numBytesDone);
+		const size_t memcpySize = varFillLen - numBytesDone;
+
+		memcpy(buf, &randUint64, memcpySize);
+		buf += memcpySize;
 	}
 
 	if(!constFillRemainderLen)
 		return;
 
-	// fill constant (i.e. non variable) remainder of buffer
-	// note: rand algo is used to not always have the same remainder and defeat dedupe
-	bufFill(&buf[varFillLen], randBlockVarAlgo->next(), constFillRemainderLen);
+	// fill remainder of buffer with same 64bit value
+	// note: rand algo is used to defeat simple dedupe across remainders of different blocks
+	bufFill(buf, randBlockVarAlgo->next(), constFillRemainderLen);
 }
 
 /**
@@ -1844,6 +1847,9 @@ ssize_t LocalWorker::cuFileRWMixWrapper(size_t fileHandleIdx, void* buf, size_t 
  */
 void LocalWorker::dirModeIterateDirs()
 {
+	if(progArgs->getNumDirs() == 0)
+		return; // nothing to do
+
 	std::array<char, PATH_BUF_LEN> currentPath;
 	const size_t numDirs = progArgs->getNumDirs();
 	const IntVec& pathFDs = progArgs->getBenchPathFDs();
@@ -2046,7 +2052,8 @@ void LocalWorker::dirModeIterateCustomDirs()
  */
 void LocalWorker::dirModeIterateFiles()
 {
-	const size_t numDirs = progArgs->getNumDirs();
+	const bool haveSubdirs = (progArgs->getNumDirs() > 0);
+	const size_t numDirs = haveSubdirs ? progArgs->getNumDirs() : 1; // set 1 to run dir loop once
 	const size_t numFiles = progArgs->getNumFiles();
 	const uint64_t fileSize = progArgs->getFileSize();
 	const IntVec& pathFDs = progArgs->getBenchPathFDs();
@@ -2068,7 +2075,7 @@ void LocalWorker::dirModeIterateFiles()
 	for(size_t dirIndex = 0; dirIndex < numDirs; dirIndex++)
 	{
 		// occasional interruption check
-		if( (dirIndex % INTERRUPTION_CHECK_INTERVAL) == 0)
+		IF_UNLIKELY( (dirIndex % INTERRUPTION_CHECK_INTERVAL) == 0)
 			checkInterruptionRequest();
 
 		// fill up this dir with all files before moving on to the next dir
@@ -2076,14 +2083,21 @@ void LocalWorker::dirModeIterateFiles()
 		for(size_t fileIndex = 0; fileIndex < numFiles; fileIndex++)
 		{
 			// occasional interruption check
-			if( (fileIndex % INTERRUPTION_CHECK_INTERVAL) == 0)
+			IF_UNLIKELY( (fileIndex % INTERRUPTION_CHECK_INTERVAL) == 0)
 				checkInterruptionRequest();
 
 			// generate current dir path
-			int printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-f%zu",
-				workerDirRank, dirIndex, workerRank, fileIndex);
+			int printRes;
+
+			if(haveSubdirs)
+				printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-f%zu",
+					workerDirRank, dirIndex, workerRank, fileIndex);
+			else
+				printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu-f%zu",
+					workerRank, fileIndex);
+
 			IF_UNLIKELY(printRes >= PATH_BUF_LEN)
-				throw WorkerException("mkdir path too long for static buffer. "
+				throw WorkerException("file path too long for static buffer. "
 					"Buffer size: " + std::to_string(PATH_BUF_LEN) + "; "
 					"workerRank: " + std::to_string(workerRank) + "; "
 					"dirIndex: " + std::to_string(dirIndex) + "; "
@@ -2620,7 +2634,8 @@ void LocalWorker::s3ModeIterateBuckets()
 				auto s3Error = createOutcome.GetError();
 
 				// bucket already existing is not an error
-				if(s3Error.GetErrorType() != Aws::S3::S3Errors::BUCKET_ALREADY_OWNED_BY_YOU)
+				if( (s3Error.GetErrorType() != Aws::S3::S3Errors::BUCKET_ALREADY_OWNED_BY_YOU) &&
+					(s3Error.GetErrorType() != Aws::S3::S3Errors::BUCKET_ALREADY_EXISTS) )
 				{
 					throw WorkerException(std::string("Bucket creation failed. ") +
 						"Endpoint: " + s3EndpointStr + "; "
@@ -2688,7 +2703,8 @@ void LocalWorker::s3ModeIterateObjects()
 		return;
 	}
 
-	const size_t numDirs = progArgs->getNumDirs();
+	const bool haveSubdirs = (progArgs->getNumDirs() > 0);
+	const size_t numDirs = haveSubdirs ? progArgs->getNumDirs() : 1; // set 1 to run dir loop once
 	const size_t numFiles = progArgs->getNumFiles();
 	const uint64_t fileSize = progArgs->getFileSize();
 	const size_t blockSize = progArgs->getBlockSize();
@@ -2708,7 +2724,7 @@ void LocalWorker::s3ModeIterateObjects()
 	for(size_t dirIndex = 0; dirIndex < numDirs; dirIndex++)
 	{
 		// occasional interruption check
-		if( (dirIndex % INTERRUPTION_CHECK_INTERVAL) == 0)
+		IF_UNLIKELY( (dirIndex % INTERRUPTION_CHECK_INTERVAL) == 0)
 			checkInterruptionRequest();
 
 		// fill up this dir with all files before moving on to the next dir
@@ -2716,12 +2732,19 @@ void LocalWorker::s3ModeIterateObjects()
 		for(size_t fileIndex = 0; fileIndex < numFiles; fileIndex++)
 		{
 			// occasional interruption check
-			if( (fileIndex % INTERRUPTION_CHECK_INTERVAL) == 0)
+			IF_UNLIKELY( (fileIndex % INTERRUPTION_CHECK_INTERVAL) == 0)
 				checkInterruptionRequest();
 
 			// generate current dir path
-			int printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-f%zu",
-				workerDirRank, dirIndex, workerRank, fileIndex);
+			int printRes;
+
+			if(haveSubdirs)
+				printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-f%zu",
+					workerDirRank, dirIndex, workerRank, fileIndex);
+			else
+				printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu-f%zu",
+					workerRank, fileIndex);
+
 			IF_UNLIKELY(printRes >= PATH_BUF_LEN)
 				throw WorkerException("object path too long for static buffer. "
 					"Buffer size: " + std::to_string(PATH_BUF_LEN) + "; "
@@ -2798,7 +2821,8 @@ void LocalWorker::s3ModeIterateObjectsRand()
 	throw WorkerException(std::string(__func__) + "called, but this was built without S3 support");
 #else
 
-	const size_t numDirs = progArgs->getNumDirs();
+	const bool haveSubdirs = (progArgs->getNumDirs() > 0);
+	const size_t numDirs = haveSubdirs ? progArgs->getNumDirs() : 1; // set 1 to run dir loop once
 	const size_t numFiles = progArgs->getNumFiles();
 	const uint64_t fileSize = progArgs->getFileSize();
 	const size_t blockSize = progArgs->getBlockSize();
@@ -2833,7 +2857,7 @@ void LocalWorker::s3ModeIterateObjectsRand()
 	while(numBytesDone < randomAmount)
 	{
 		// occasional interruption check
-		if( (numBytesDone % interruptCheckBytes) == 0)
+		IF_UNLIKELY( (numBytesDone % interruptCheckBytes) == 0)
 			checkInterruptionRequest();
 
 		const size_t dirIndex = randDirIndexGen.getNextOffset();
@@ -2841,8 +2865,15 @@ void LocalWorker::s3ModeIterateObjectsRand()
 		const uint64_t currentBlockSize = rwOffsetGen->getNextBlockSizeToSubmit();
 
 		// generate current dir path
-		int printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-f%zu",
-			workerDirRank, dirIndex, workerRank, fileIndex);
+		int printRes;
+
+		if(haveSubdirs)
+			printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-f%zu",
+				workerDirRank, dirIndex, workerRank, fileIndex);
+		else
+			printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu-f%zu",
+				workerRank, fileIndex);
+
 		IF_UNLIKELY(printRes >= PATH_BUF_LEN)
 			throw WorkerException("object path too long for static buffer. "
 				"Buffer size: " + std::to_string(PATH_BUF_LEN) + "; "
@@ -3822,7 +3853,8 @@ void LocalWorker::s3ModeListObjParallel()
 	throw WorkerException(std::string(__func__) + "called, but this was built without S3 support");
 #else
 
-	const size_t numDirs = progArgs->getNumDirs();
+	const bool haveSubdirs = (progArgs->getNumDirs() > 0);
+	const size_t numDirs = haveSubdirs ? progArgs->getNumDirs() : 1; // set 1 to run dir loop once
 	const size_t numFiles = progArgs->getNumFiles();
 	const StringVec& bucketVec = progArgs->getBenchPaths();
 	std::array<char, PATH_BUF_LEN> currentPath;
@@ -3843,8 +3875,15 @@ void LocalWorker::s3ModeListObjParallel()
 		StringSet expectedObjs; // for verification (if requested by user)
 
 		// generate list prefix for current dir
-		int printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-",
-			workerDirRank, dirIndex, workerRank);
+		int printRes;
+
+		if(haveSubdirs)
+			printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-",
+						workerDirRank, dirIndex, workerRank);
+		else
+			printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu-",
+						workerRank);
+
 		IF_UNLIKELY(printRes >= PATH_BUF_LEN)
 			throw WorkerException("object path too long for static buffer. "
 				"Buffer size: " + std::to_string(PATH_BUF_LEN) + "; "
@@ -3857,8 +3896,15 @@ void LocalWorker::s3ModeListObjParallel()
 		// build list of expected objs in dir for verification. (std::set for alphabetic order)
 		for(size_t fileIndex = 0; doListObjVerify && (fileIndex < numFiles); fileIndex++)
 		{
-			int printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-f%zu",
-				workerDirRank, dirIndex, workerRank, fileIndex);
+			int printRes;
+
+			if(haveSubdirs)
+				printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu/d%zu/r%zu-f%zu",
+					workerDirRank, dirIndex, workerRank, fileIndex);
+			else
+				printRes = snprintf(currentPath.data(), PATH_BUF_LEN, "r%zu-f%zu",
+					workerRank, fileIndex);
+
 			IF_UNLIKELY(printRes >= PATH_BUF_LEN)
 				throw WorkerException("Verification object path too long for static buffer. "
 					"Buffer size: " + std::to_string(PATH_BUF_LEN) + "; "
