@@ -1,5 +1,24 @@
 # Changelog of elbencho
 
+## v2.1.6 (work in progress)
+
+### General Changes
+* When using S3 option "--s3randobj", show IOPS in addition to throughput.
+* Added new Nvidia CUDA repo keys to MagnumIO docker container.
+* When "--rand" is specified in S3 write phase then automatically fall back "--backward" instead of refusing to run.
+
+### Fixes
+* Removed variables in comments of RPM spec template file for compatibility with RHEL9.
+
+## v2.1.5 (Apr 30, 2022)
+
+### General Changes
+* Updated mimalloc memory allocation library to latest version 2.0.6
+* Added dockerfile for SLES 15
+
+### Contributors
+* Thanks to Sherif Louis for helpful comments and suggestions.
+
 ## v2.1.3 (Apr 14, 2022)
 
 ### Fixes
