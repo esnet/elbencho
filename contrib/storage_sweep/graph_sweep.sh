@@ -42,7 +42,7 @@
 # Usage : Assuming graph_sweep.sh is available from the $PATH,
 #
 #         cd src_data_dir;\
-#         sudo graph_sweep.sh [-r s|m|l][-t N][-S fs_block_size]\
+#         sudo graph_sweep.sh [-r s|m|l][-t N][-S fs_block_size] [-w r|w] \
 #         [-b block_size][-B][-N num_sweep][-o output_dir][-v][-T][-p][-n]
 #
 #         where src_data_dir is the directory that holds all test
@@ -89,6 +89,7 @@ today=$(date +%F)
 out_file_base=$(hostname)_tests_"$today"
 verbose=
 dry_run=
+readwrite='w'
 #
 # The two tools that this wrapper is used for.
 #
@@ -103,7 +104,8 @@ gnuplot=/usr/bin/gnuplot
 # chosen such that people can still use a spreadsheet app should they
 # choose :-S
 #
-sweep_csv="$output_dir"/sweep.csv
+sweep_write_csv="$output_dir"/sweep_write.csv
+sweep_read_csv="$output_dir"/sweep_read.csv
 #
 # You can customize the following and run gnuplot "$sweep_gplt" to
 # regenerate a plot to your liking, with your choice of terminal type,
@@ -194,6 +196,7 @@ Command line options:
     -r the range to sweep, one of s: LOSF, m: medium, l: large.  If not
        specified, a full sweep is carried out to be consistent with 
        mtelbencho.sh's usage
+    -w select read (r) or write (w) test (default: w)
     -t the number of threads to run elbencho. Default is auto-detect
     -s the path to the directory holding test datasets
     -S filesystem (aka fs) block size - positive integer; must be 2th
@@ -215,7 +218,7 @@ Command line options:
     -n dry-run; to print out tests that would have run
 
 The usage: 
-$ sudo graph_sweep.sh [-h][-r range][-t numthreads][-s dirpath]\
+$ sudo graph_sweep.sh [-h][-r range][-t numthreads][-s dirpath] -w [r|w] \
   [-S fs_block_size][-b block_size][-B][-N num_sweep][-o output_dir]\
   [-v][-T][-p][-n]
 
@@ -297,7 +300,7 @@ run_mtelbencho()
         echo "***> This is $(print_iter "$i") sweep"
         out_file="$out_file_base"_"$i".txt
         out_file="$output_dir/$out_file"
-        cmd="$mtelbencho -t $threads -b $block_size -s $src_data_dir "
+        cmd="$mtelbencho -t $threads -b $block_size -s $src_data_dir -w $readwrite "
         [[ "$fs_block_size" -ne "4" ]] && cmd+="-S $fs_block_size "
         [[ "$buffered" ]] && cmd+="-B "
         [[ "$verbose" ]] && cmd+="-v "
@@ -312,13 +315,45 @@ run_mtelbencho()
     done
 }
 
+create_csv()
+{
+    local i
+    input=$1
+    output=$2
+    label=$3
+    echo "$input $output $label"
+    echo -e "Dataset,$label" > "$output"
+
+    if [[ -z "$range_to_sweep" ]] || [[ "$range_to_sweep" == 's' ]] ; then
+        i=0
+    elif [[ "$range_to_sweep" == 'm' ]]; then
+        i=10
+    elif [[ "$range_to_sweep" == 'l' ]]; then
+        i=20
+    fi
+
+    # The ending index doesn't pose a problem. The number of lines in
+    # the input file automatically determines that.
+    local mean_value
+    while IFS= read -r line
+    do
+        mean_value=$( echo "$line"|\
+                          awk '{sum = 0; for (i = 1; i <= NF; i++) 
+                          sum += $i; sum /= NF; print sum}')
+        echo "${xlabels[$i]},$mean_value"
+        ((i++))
+    done < "$input" >>"$output"
+    ensure_file_exists "$output"
+}
+
 extract_results_for_plotting()
 {
     local out_files
     out_files="${out_file_base}_*.txt"
     out_files="$output_dir/$out_files"
     local pasted_file
-    pasted_file="$output_dir"/plot.dat
+    pasted_file="$output_dir"/plot_write.dat
+    pasted_rfile="$output_dir"/plot_read.dat
     local i=0
     local pfile
     # If Gbps is preferred, use the following conversion:
@@ -335,41 +370,37 @@ extract_results_for_plotting()
     fi
     for f in $out_files
     do
-        pfile="$output_dir"/p"$i"
-        grep Throughput < "$f"\
-            |awk -v cf="$conv" '{printf "%.3f\n", (($4 + $5)*cf/2)}' \
-                 > "$pfile"
-        ensure_file_exists "$pfile"
+        pfile="$output_dir"/p_write"$i"
+	if [[ "$readwrite" = "r" ]]; then
+	    rpfile="$output_dir"/p_read"$i"
+	    grep Throughput < "$f"\
+		|awk -v cf="$conv" '!(NR % 2) {printf "%.3f\n", (($4 + $5)*cf/2)}' \
+                     > "$rpfile"
+            grep Throughput < "$f"\
+                |awk -v cf="$conv" '(NR % 2) {printf "%.3f\n", (($4 + $5)*cf/2)}' \
+                     > "$pfile"
+	    ensure_file_exists "$rpfile"
+            ensure_file_exists "$pfile"
+	else
+	    grep Throughput < "$f"\
+                |awk -v cf="$conv" '{printf "%.3f\n", (($4 + $5)*cf/2)}' \
+                     > "$pfile"
+            ensure_file_exists "$pfile"
+	fi
         ((i++))
     done
     # Join the p"$i" files into a single output file, using the default \t
-    paste "$output_dir"/p* > "$pasted_file"
+    paste "$output_dir"/p_write* > "$pasted_file"
     ensure_file_exists "$pasted_file"
-    # Create the final input file for gnuplot, stored in $sweep_csv, a global
-    # variable :)
-    local input
-    input="$pasted_file"
-    local i
-    if [[ -z "$range_to_sweep" ]] || [[ "$range_to_sweep" == 's' ]] ; then
-        i=0
-    elif [[ "$range_to_sweep" == 'm' ]]; then
-        i=10
-    elif [[ "$range_to_sweep" == 'l' ]]; then
-        i=20
+    if [[ "$readwrite" = "r" ]]; then
+	paste "$output_dir"/p_read* > "$pasted_rfile"
+        ensure_file_exists "$pasted_rfile"
     fi
-    # The ending index doesn't pose a problem. The number of lines in
-    # the input file automatically determines that.
-    local mean_value 
-    echo -e "Dataset,Mean-value" > "$sweep_csv"
-    while IFS= read -r line
-    do
-        mean_value=$( echo "$line"|\
-                          awk '{sum = 0; for (i = 1; i <= NF; i++) 
-                          sum += $i; sum /= NF; print sum}')
-        echo "${xlabels[$i]},$mean_value"
-        ((i++))
-    done < "$input" >>"$sweep_csv"
-    ensure_file_exists "$sweep_csv"
+    # Create the final input files for gnuplot
+    create_csv "$pasted_file" "$sweep_write_csv" "write"
+    if [[ "$readwrite" = "r" ]]; then
+	create_csv "$pasted_rfile" "$sweep_read_csv" "read"
+    fi
     # Now we are ready to generate plot, either directly or optionally
     # retrieve the plot data thus generated to a workstation.
 }
@@ -405,6 +436,9 @@ set ylabel "Mean throughput ($speed)"
 set ylabel font "Times Bold,10"
 set key autotitle columnhead
 set yrange [0:]
+
+file_exists(file) = int(system("[ -f '".file."' ] && echo '1' || echo '0'"))
+
 #
 # Use the line plot and enable grid lines in both X and Y
 # directions.
@@ -424,7 +458,7 @@ set grid ls 100
 # and set it below in the plot command.
 #
 set style line 101 lw 3 lt rgb "#FF8C00" # line color in drak orange
-#set style line 102 lw 3 lt rgb "#0000FF" # line color in blue
+set style line 102 lw 3 lt rgb "#0000FF" # line color in blue
 #set style line 103 lw 4 lt rgb "#228B22" # line color in forestgreen
 #
 # Rotate the xtics 90 degrees to avoid clutter. Also make sure the
@@ -436,12 +470,13 @@ set xtics font "Verdana,8"
 set key left top # legend placement
 set key font "Verdana,8"
 set key Left     # note the cap 'L'!  Left justify the key text
-set key width -3 # shift the legend to the left
+set key width 0  # shift the legend to the left
 
 #
 set output "$sweep_svg"
 set datafile separator ','  # so that gnuplot understand we use a csv file
-plot "$sweep_csv" using 2:xtic(1) ls 101
+if (file_exists("$sweep_read_csv")) plot "$sweep_write_csv" using 2:xtic(1) ls 101, \
+      "$sweep_read_csv" using 2:xtic(1) ls 102
 EOF
     echo "$gnuplot_settings" > "$sweep_gplt"
     ensure_file_exists "$sweep_gplt" 
@@ -529,6 +564,16 @@ verify_num_sweep()
     fi
 }
 
+verify_readwrite()
+{
+    local msg
+    if [[ "$readwrite" != "w" ]] && [[ "$readwrite" != "r" ]]; then
+	msg="readwrite (-w) must be 'r' or 'w'"
+	echo "$msg"
+	exit 1
+    fi
+}
+
 mitigate_human_errors()
 {
     #
@@ -583,9 +628,11 @@ show_option_settings()
     echo "traditional     : $traditional"
     echo "push_button_plot: $push_button_plot"
     echo "dry_run         : $dry_run"
-    echo "sweep_csv       : $sweep_csv"
+    echo "sweep_write_csv : $sweep_write_csv"
+    echo "sweep_read_csv  : $sweep_read_csv"
     echo "sweep_gplt      : $sweep_gplt"
     echo "sweep_svg       : $sweep_svg"
+    echo "readwrite       : $readwrite"
 }
 
 is_power_of_two()
@@ -625,7 +672,7 @@ show_test_duration()
 # main()
 {
     begin_test=$(date +"%s")
-    while getopts ":hr:t:s:S:b:N:o:BvTnp" opt; do
+    while getopts ":hr:t:s:S:b:N:o:w:BvTnp" opt; do
         case $opt in
             h)  help
                 ;;
@@ -658,13 +705,17 @@ show_test_duration()
                 ;;
             n)  dry_run=1
                 ;;
+	    w)  readwrite=$OPTARG
+		verify_readwrite
+		;;
             *)  echo "Error: invalid option given!"
                 exit 2
                 ;;
         esac
     done
     mitigate_human_errors
-    sweep_csv="$output_dir"/sweep.csv
+    sweep_write_csv="$output_dir"/sweep_write.csv
+    sweep_read_csv="$output_dir"/sweep_read.csv
     sweep_gplt="$output_dir"/sweep.gplt
     sweep_svg="$output_dir"/sweep.svg
     [[ "$verbose" ]] && show_elbencho_version

@@ -24,9 +24,7 @@
 #          2. By default, it runs only tests in direct IO mode with
 #             elbencho (see elbencho --help-all for --direct) but if
 #             the option `-B` is specified, it will run elbencho in
-#             buffered mode.  Note that the script runs only write
-#             tests, which is the most important to the 4th IT pillar
-#             - moving data at scale and speed.
+#             buffered mode.
 #          3. The wrapper assumes all test datasets are located in the
 #             current working directory (`pwd`). Nevertheless, the -s
 #             option enables to specify the directory holding all test
@@ -68,8 +66,8 @@
 # Usage : Assuming mtelbencho.sh is available from the $PATH,
 #         cd src_data_dir\
 #         sudo mtelbencho.sh [-t N] [-r s|m|l] -b arg [-S fs_block_size]
-#         [-v] [-n], where src_data_dir is the directory that holds
-#         all test datasets, N is the desired thread number to run
+#         [-w r|w] [-v] [-n], where src_data_dir is the directory that
+#         hods all test datasets, N is the desired thread number to run
 #         elbencho. For other usage tips and examples, on the CLI, type
 #         mtelbencho.sh -h for more info.
 #
@@ -302,22 +300,28 @@ los_files() {
         if [[ "$verbose" ]]; then
             echo "Working on $dataset with $threads threads..."
         fi
-        
-        cmd="elbencho --dirsharing -$type -t $threads --nolive "
-        cmd+="-F -d -n 1 -N $file_per_thread "
+
+        cmd="elbencho --dirsharing -t $threads --nolive "
+	cmd+="-d -n 1 -N $file_per_thread "
         cmd+="-s ${file_size_multiplier}k --trunctosize "
         cmd+="-b $block_size --dropcache --nodelerr "
-        
+
         # Almost all known modern file systems have a default file
         # system block size value 4096 bytes (4 KiB). For a file whose
         # size is smaller than this value, direct IO is not feasible
         # so not specified.
-        if [[ "$file_size_multiplier" -lt "$fs_block_size" ]] ||
-               [[ "$buffered" ]]; then
-            cmd+="$dataset"
-        else
-            cmd+="--direct $dataset"
+        if ! [[ "$file_size_multiplier" -lt "$fs_block_size" ]] &&
+               ! [[ "$buffered" ]]; then
+            cmd+="--direct "
+	fi
+
+        if [[ "$type" = "r" ]]; then
+            # Run default write first to generate data
+            echo "***> Running write test first to generate read test data"
+            rcmd="$cmd -w $dataset"
+            $rcmd
         fi
+        cmd+="-F -$type $dataset"
         dry_or_real_run
     done
 }
@@ -350,15 +354,22 @@ medium_files()
             echo "Working on $dataset with $threads threads..."
         fi
 
-        cmd="elbencho --dirsharing -$type -t $threads --nolive "
-        cmd+="-F -d -n 1 -N $file_per_thread "
+        cmd="elbencho -t $threads --nolive "
+	cmd+="-d -n 1 -N $file_per_thread "
         cmd+="-s ${file_size_multiplier}m --trunctosize "
         cmd+="-b $block_size --dropcache --nodelerr "
-        
+
         if ! [[ "$buffered" ]]; then
             cmd+="--direct "
         fi
-        cmd+="$dataset"
+
+        if [[ "$type" = "r" ]]; then
+            # Run default write first to generate data
+            echo "***> Running write test first to generate read test data"
+            rcmd="$cmd -w $path"
+            $rcmd
+        fi
+        cmd+="-F -$type $path"
         dry_or_real_run
         number_of_files=$(echo "$number_of_files/2"|bc)
     done
@@ -387,19 +398,28 @@ large_files()
         if [[ "$verbose" ]]; then
             echo "Working on $dataset with $threads threads..."
         fi
-        
-        cmd="elbencho -$type -t $threads --nolive -F "
+
+        cmd="elbencho -t $threads --nolive "
         cmd+="-s ${file_size_multiplier}g --trunctosize "
         cmd+="-b $block_size --dropcache --nodelerr "
-        
+
         if ! [[ "$buffered" ]]; then
             cmd+="--direct "
-        fi       
-        if [[ "$upper" -eq 1 ]]; then
-            cmd+="$dataset/f0 "
-        else
-            cmd+="$(eval echo "$dataset/f{0..$upper}")"
         fi
+
+        if [[ "$upper" -eq 1 ]]; then
+	    path="$dataset/f0 "
+        else
+	    path="$(eval echo "$dataset/f{0..$upper}")"
+        fi
+
+	if [[ "$type" = "r" ]]; then
+	    # Run default write first to generate data
+	    echo "***> Running write test first to generate read test data"
+	    rcmd="$cmd -w $path"
+	    $rcmd
+	fi
+	cmd+="-F -$type $path"
         dry_or_real_run     
         number_of_files=$(echo "$number_of_files/2"|bc)
     done
@@ -470,6 +490,16 @@ verify_block_size()
     fi
 }
 
+verify_type()
+{
+    local msg
+    if [[ "$type" != "w" ]] && [[ "$type" != "r" ]]; then
+	msg="type (-w) must be 'r' or 'w'"
+	echo "$msg"
+	exit 1
+    fi
+}
+
 is_power_of_two()
 {
     if ! ((fs_block_size > 0 &&
@@ -520,7 +550,7 @@ show_option_settings()
 # main()
 {
     begin_test=$(date +"%s")
-    while getopts ":hr:t:s:S:b:Bvn" opt; do
+    while getopts ":hr:t:s:S:b:w:Bvn" opt; do
         case $opt in
             h)  help
                 ;;
@@ -545,6 +575,9 @@ show_option_settings()
                 ;;
             n)  dry_run=1
                 ;;
+	    w)  type=$OPTARG
+		verify_type
+		;;
             *)  echo "Error: invalid option given!"
                 exit 2
                 ;;
