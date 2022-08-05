@@ -332,7 +332,7 @@ medium_files()
     number_of_files=1048576
     local power_base
     power_base=2
-    #local cmd
+    local cmd
     local end
     end=10
     
@@ -354,7 +354,7 @@ medium_files()
             echo "Working on $dataset with $threads threads..."
         fi
 
-        cmd="elbencho -t $threads --nolive "
+        cmd="elbencho --dirsharing -t $threads --nolive "
 	cmd+="-d -n 1 -N $file_per_thread "
         cmd+="-s ${file_size_multiplier}m --trunctosize "
         cmd+="-b $block_size --dropcache --nodelerr "
@@ -366,10 +366,10 @@ medium_files()
         if [[ "$type" = "r" ]]; then
             # Run default write first to generate data
             echo "***> Running write test first to generate read test data"
-            rcmd="$cmd -w $path"
+            rcmd="$cmd -w $dataset"
             $rcmd
         fi
-        cmd+="-F -$type $path"
+        cmd+="-F -$type $dataset"
         dry_or_real_run
         number_of_files=$(echo "$number_of_files/2"|bc)
     done
