@@ -1,7 +1,8 @@
 #include <csignal>
 #include <iostream>
 #include "Coordinator.h"
-#include "HTTPService.h"
+#include "HTTPServiceSWS.h"
+#include "HTTPServiceUWS.h"
 #include "ProgArgs.h"
 #include "ProgException.h"
 #include "toolkits/S3Tk.h"
@@ -21,7 +22,7 @@ int Coordinator::main()
 
 	try
 	{
-		SignalTk::registerFaultSignalHandlers();
+		SignalTk::registerFaultSignalHandlers(progArgs);
 
 		// HTTP service mode
 		// note: no other threads may be running when HTTPService.startServer() daemonizes.
@@ -29,9 +30,19 @@ int Coordinator::main()
 		{
 			LoggerBase::enableErrHistory();
 
-			HTTPService(progArgs, workerManager, statistics).startServer();
+			if(progArgs.getUseAlternativeHTTPService() )
+			{
+				#ifndef ALTHTTPSVC_SUPPORT
+					throw ProgException("This executable was built without support for alternative "
+						"HTTP service.");
+				#else
+					HTTPServiceUWS(progArgs, workerManager, statistics).startServer();
+				#endif // ALTHTTPSVC_SUPPORT
+			}
+			else
+				HTTPServiceSWS(progArgs, workerManager, statistics).startServer();
 
-			Logger() << "HTTP service ended." << std::endl; // should not happen
+			LOGGER(Log_VERBOSE, "HTTP service stopped." << std::endl);
 
 			workerManager.interruptAndNotifyWorkers();
 			goto joinall_and_exit;
@@ -169,6 +180,8 @@ void Coordinator::runBenchmarkPhase(BenchPhase newBenchPhase)
 	// print stats
 	statistics.printPhaseResults();
 
+	workerManager.cleanupWorkersAfterPhaseDone();
+
 	// check again for interrupted or timeout (might be last phase and we want to return an error)
 	checkInterruptionBetweenPhases();
 }
@@ -199,60 +212,102 @@ void Coordinator::runSyncAndDropCaches()
  */
 void Coordinator::runBenchmarks()
 {
+	struct BenchPhaseConfig
+	{
+	    BenchPhase benchPhase;
+	    bool runPhase;
+	};
+
+	// array of all existing bench phases
+	/* note: multiple phases can be selected for a single run and this array defines the order in
+		which they run, so make sure to have reasonable ordering here (e.g. creates before
+		deletes). */
+
+	std::array allBenchPhasesArray
+	{
+		BenchPhaseConfig { BenchPhase_CREATEDIRS, progArgs.getRunCreateDirsPhase() },
+		BenchPhaseConfig { BenchPhase_CREATEFILES, progArgs.getRunCreateFilesPhase() },
+		BenchPhaseConfig { BenchPhase_STATFILES, progArgs.getRunStatFilesPhase() },
+		BenchPhaseConfig { BenchPhase_PUTBUCKETACL, progArgs.getRunS3BucketAclPut() },
+		BenchPhaseConfig { BenchPhase_PUTOBJACL, progArgs.getRunS3AclPut() },
+		BenchPhaseConfig { BenchPhase_GETOBJACL, progArgs.getRunS3AclGet() },
+		BenchPhaseConfig { BenchPhase_GETBUCKETACL, progArgs.getRunS3BucketAclGet() },
+		BenchPhaseConfig { BenchPhase_LISTOBJECTS, progArgs.getRunListObjPhase() },
+		BenchPhaseConfig { BenchPhase_LISTOBJPARALLEL, progArgs.getRunListObjParallelPhase() },
+		BenchPhaseConfig { BenchPhase_READFILES, progArgs.getRunReadPhase() },
+		BenchPhaseConfig { BenchPhase_MULTIDELOBJ, progArgs.getRunMultiDelObjPhase() },
+		BenchPhaseConfig { BenchPhase_DELETEFILES, progArgs.getRunDeleteFilesPhase() },
+		BenchPhaseConfig { BenchPhase_DELETEDIRS, progArgs.getRunDeleteDirsPhase() },
+	};
+
+	// vector of enabled bench phases
+
+	std::vector<BenchPhase> enabledBenchPhasesVec;
+
+	for(BenchPhaseConfig benchPhaseConfig : allBenchPhasesArray)
+	{
+		if(benchPhaseConfig.runPhase)
+			enabledBenchPhasesVec.push_back(benchPhaseConfig.benchPhase);
+	}
+
+
 	for(size_t iterationIndex = 0; iterationIndex < progArgs.getIterations(); iterationIndex++)
 	{	
 		statistics.printPhaseResultsTableHeader();
 
 		runSyncAndDropCaches();
 
-		if(progArgs.getRunCreateDirsPhase() )
+		for(unsigned benchPhaseIdx=0; benchPhaseIdx < enabledBenchPhasesVec.size(); benchPhaseIdx++)
 		{
-			runBenchmarkPhase(BenchPhase_CREATEDIRS);
-			runSyncAndDropCaches();
-		}
+			// run actual test phase
+			runBenchmarkPhase(enabledBenchPhasesVec[benchPhaseIdx] );
 
-		if(progArgs.getRunCreateFilesPhase() )
-		{
-			runBenchmarkPhase(BenchPhase_CREATEFILES);
+			// run special "sync" and "drop caches" phases
 			runSyncAndDropCaches();
-		}
 
-		if(progArgs.getRunStatFilesPhase() )
-		{
-			runBenchmarkPhase(BenchPhase_STATFILES);
-			runSyncAndDropCaches();
-		}
+			if(benchPhaseIdx < (enabledBenchPhasesVec.size() - 1) )
+			{
+				// delay between phases
+				if(progArgs.getNextPhaseDelaySecs() )
+					sleep(progArgs.getNextPhaseDelaySecs() );
 
-		if(progArgs.getRunListObjPhase() )
-		{
-			runBenchmarkPhase(BenchPhase_LISTOBJECTS);
-			runSyncAndDropCaches();
-		}
-
-		if(progArgs.getRunListObjParallelPhase() )
-		{
-			runBenchmarkPhase(BenchPhase_LISTOBJPARALLEL);
-			runSyncAndDropCaches();
-		}
-
-		if(progArgs.getRunReadPhase() )
-		{
-			runBenchmarkPhase(BenchPhase_READFILES);
-			runSyncAndDropCaches();
-		}
-	
-		if(progArgs.getRunDeleteFilesPhase() )
-		{
-			runBenchmarkPhase(BenchPhase_DELETEFILES);
-			runSyncAndDropCaches();
-		}
-
-		if(progArgs.getRunDeleteDirsPhase() )
-		{
-			runBenchmarkPhase(BenchPhase_DELETEDIRS);
-			runSyncAndDropCaches();
+				// rotate hosts (which requires new prep phase for ranks)
+				rotateHosts();
+			}
 		}
 	}
+}
+
+/**
+ * Stop and restart all workers after inter-phase hosts rotation. This is necessary because we need
+ * to run the prep phase again to update the worker ranks.
+ *
+ * This is a no-op if the user didn't request hosts rotation.
+ */
+void Coordinator::rotateHosts()
+{
+	if(progArgs.getHostsVec().empty() ||
+		!progArgs.getRotateHostsNum() ||
+		progArgs.getUseNetBench() )
+		return;
+
+	workerManager.interruptAndNotifyWorkers();
+	workerManager.joinAllThreads();
+	workerManager.cleanupWorkersAfterPhaseDone();
+	workerManager.deleteThreads();
+
+	if(!LoggerBase::getErrHistory().empty() )
+	{
+		std::cerr << LoggerBase::getErrHistory();
+		LoggerBase::clearErrHistory();
+	}
+
+	progArgs.rotateHosts();
+
+	/* note: workerManager.prepareThreads() blocks signal interrupt signals for spawned threads
+		so we don't need to reset signal handlers here. */
+
+	workerManager.prepareThreads();
 }
 
 /**

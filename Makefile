@@ -3,9 +3,9 @@
 #
 
 EXE_NAME           ?= elbencho
-EXE_VER_MAJOR      ?= 2
-EXE_VER_MINOR      ?= 1
-EXE_VER_PATCHLEVEL ?= 6
+EXE_VER_MAJOR      ?= 3
+EXE_VER_MINOR      ?= 0
+EXE_VER_PATCHLEVEL ?= 8
 EXE_VERSION        ?= $(EXE_VER_MAJOR).$(EXE_VER_MINOR)-$(EXE_VER_PATCHLEVEL)
 EXE                ?= $(BIN_PATH)/$(EXE_NAME)
 EXE_UNSTRIPPED     ?= $(EXE)-unstripped
@@ -21,17 +21,19 @@ PKG_INST_PATH      ?= /usr/bin
 
 CXX                ?= g++
 STRIP              ?= strip
-CXX_FLAVOR         ?= c++14
+CXX_FLAVOR         ?= c++17
 
-CXXFLAGS_BOOST     ?= -DBOOST_SPIRIT_THREADSAFE
-LDFLAGS_BOOST      ?= -lboost_program_options -lboost_system -lboost_thread
+CXXFLAGS_BOOST     ?= -DBOOST_SPIRIT_THREADSAFE -DBOOST_BIND_GLOBAL_PLACEHOLDERS
 LDFLAGS_AIO        ?= -laio
+LDFLAGS_BOOST      ?= -lboost_program_options -lboost_system -lboost_thread
 LDFLAGS_NUMA       ?= -lnuma
 
+ALTHTTPSVC_SUPPORT ?= 0
 BACKTRACE_SUPPORT  ?= 1
 COREBIND_SUPPORT   ?= 1
 LIBAIO_SUPPORT     ?= 1
 LIBNUMA_SUPPORT    ?= 1
+NCURSES_SUPPORT    ?= 1
 SYNCFS_SUPPORT     ?= 1
 S3_SUPPORT         ?= 0
 SYSCALLH_SUPPORT   ?= 1
@@ -44,7 +46,8 @@ CXXFLAGS_COMMON   = -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 $(CXXFLAGS_BOOS
 CXXFLAGS_RELEASE  = -O3 -Wuninitialized
 CXXFLAGS_DEBUG    = -O0 -D_FORTIFY_SOURCE=2 -DBUILD_DEBUG
 
-LDFLAGS_COMMON    = -rdynamic -pthread -lrt $(LDFLAGS_NUMA) $(LDFLAGS_AIO) $(LDFLAGS_BOOST)
+LDFLAGS_COMMON    = -rdynamic -pthread -lrt -lstdc++fs $(LDFLAGS_NUMA) $(LDFLAGS_AIO) \
+	$(LDFLAGS_BOOST)
 LDFLAGS_RELASE    = -O3
 LDFLAGS_DEBUG     = -O0
 
@@ -60,16 +63,22 @@ LDFLAGS  = $(LDFLAGS_COMMON) $(LDFLAGS_DEBUG) $(LDFLAGS_EXTRA)
 else
 CXXFLAGS = $(CXXFLAGS_COMMON) $(CXXFLAGS_RELEASE) $(CXXFLAGS_EXTRA)
 LDFLAGS  = $(LDFLAGS_COMMON) $(LDFLAGS_RELASE) $(LDFLAGS_EXTRA)
+
+  ifeq ($(CXX), g++)
+  # This is to enable gcc's automatic SIMD vectorization for RandAlgoXoshiro256ppSIMD.
+  # ("-fopt-info-vec" can be used to confirm that all loops in nextInternalNway() get vectorized.)
+  # For background see https://prng.di.unimi.it/ section "Vectorization".
+  CXXFLAGS_SPECIAL_SIMD += -fdisable-tree-cunrolli 
+  endif
 endif
 
 # Dynamic or static linking
 ifeq ($(BUILD_STATIC), 1)
-LDFLAGS            += -static -lncursesw
+LDFLAGS            += -static
 LDFLAGS_S3_STATIC  += -l curl -l ssl -l crypto -l tls -l z -l nghttp2 -l brotlidec -l brotlicommon \
-	-l dl
+	-l idn2 -l unistring -l cares -l dl
 else # dynamic linking
-LDFLAGS += -lncurses
-LDFLAGS_S3_DYNAMIC += -l curl -l ssl -l crypto -l dl
+LDFLAGS_S3_DYNAMIC += -l curl -l ssl -l crypto -l z -l dl
 endif
 
 # Compiler and linker flags for S3 support
@@ -79,12 +88,12 @@ CXXFLAGS += -DS3_SUPPORT -Wno-overloaded-virtual
 LDFLAGS  += -L $(EXTERNAL_PATH)/aws-sdk-cpp_install/lib* -l:libaws-sdk-all.a \
 	$(LDFLAGS_S3_DYNAMIC) $(LDFLAGS_S3_STATIC)
 
- # Apply user-provided AWS SDK include dir if given
- ifeq ($(AWS_INCLUDE_DIR),)
- CXXFLAGS += -I $(EXTERNAL_PATH)/aws-sdk-cpp_install/include
- else
- CXXFLAGS += -I $(AWS_INCLUDE_DIR)
- endif
+  # Apply user-provided AWS SDK include dir if given
+  ifeq ($(AWS_INCLUDE_DIR),)
+  CXXFLAGS += -I $(EXTERNAL_PATH)/aws-sdk-cpp_install/include
+  else
+  CXXFLAGS += -I $(AWS_INCLUDE_DIR)
+  endif
 
 endif
 
@@ -94,6 +103,33 @@ endif
 ifeq ($(USE_MIMALLOC), 1)
 CXXFLAGS += -DUSE_MIMALLOC
 LDFLAGS_MIMALLOC_TAIL := -L external/mimalloc/build -l:libmimalloc.a
+endif
+
+# Support for uWS (Micro Web Sockets) HTTP service.
+ifeq ($(ALTHTTPSVC_SUPPORT), 1)
+CXXFLAGS += -DALTHTTPSVC_SUPPORT -I $(EXTERNAL_PATH)/uWebSockets/src \
+	-I $(EXTERNAL_PATH)/uWebSockets/uSockets/src -DUWS_NO_ZLIB -DLIBUS_NO_SSL
+LDFLAGS  += -L $(EXTERNAL_PATH)/uWebSockets/uSockets -l:uSockets.a
+endif
+
+# Support for Hadoop HDFS
+# (Note: "lib/amd64/server" is for OpenJDK 1.8 on RHEL8.)
+ifeq ($(HDFS_SUPPORT), 1)
+CXXFLAGS += -DHDFS_SUPPORT -I $(HADOOP_HOME)/include
+LDFLAGS  += -L $(HADOOP_HOME)/lib/native -l:libhdfs.a -L $(JAVA_HOME)/lib/server \
+	-L $(JAVA_HOME)/lib/amd64/server -l jvm
+endif
+
+# Support for ncurses
+ifeq ($(NCURSES_SUPPORT), 1)
+CXXFLAGS += -DNCURSES_SUPPORT
+
+  ifeq ($(BUILD_STATIC), 1)
+    LDFLAGS += -lncursesw
+  else # dynamic linking
+    LDFLAGS += -lncurses
+  endif
+
 endif
 
 # Support build in Cygwin environment
@@ -109,7 +145,7 @@ LIBNUMA_SUPPORT    := 0
 COREBIND_SUPPORT   := 0
 SYSCALLH_SUPPORT   := 0
 
-CXX_FLAVOR         := gnu++14
+CXX_FLAVOR         := gnu++17
 CXXFLAGS           += -DCYGWIN_SUPPORT
 LDFLAGS_AIO        :=
 LDFLAGS_NUMA       :=
@@ -195,15 +231,30 @@ else
 	@$(CXX) $(CXXFLAGS) -c $(@:.o=.cpp) -o $(@)
 endif
 
+# This is a special case because we need special compile options to get gcc to enable loop unrolling
+# and SIMD conversion, hence the additional "CXXFLAGS_SPECIAL_SIMD".
+source/toolkits/random/RandAlgoSelectorTk.o: source/toolkits/random/RandAlgoSelectorTk.cpp
+ifdef BUILD_VERBOSE
+	$(CXX) $(CXXFLAGS) -c $(@:.o=.cpp) -E -MMD -MF $(@:.o=.d) -MT $(@) -o /dev/null
+	$(CXX) $(CXXFLAGS) $(CXXFLAGS_SPECIAL_SIMD) -c $(@:.o=.cpp) -o $(@)
+else
+	@echo [DEP] $(@:.o=.d)
+	@$(CXX) $(CXXFLAGS) -c $(@:.o=.cpp) -E -MMD -MF $(@:.o=.d) -MT $(@) -o /dev/null
+	@echo [CXX special SIMD] $@
+	@$(CXX) $(CXXFLAGS) $(CXXFLAGS_SPECIAL_SIMD) -c $(@:.o=.cpp) -o $(@)
+endif
+
 $(OBJECTS): Makefile | externals features-info # Makefile dep to rebuild all on Makefile change
 
 externals:
 ifdef BUILD_VERBOSE
 	PREP_AWS_SDK=$(S3_SUPPORT) AWS_LIB_DIR=$(AWS_LIB_DIR) AWS_INCLUDE_DIR=$(AWS_INCLUDE_DIR) \
-		PREP_MIMALLOC=$(USE_MIMALLOC) $(EXTERNAL_PATH)/prepare-external.sh
+		PREP_MIMALLOC=$(USE_MIMALLOC) PREP_UWS=$(ALTHTTPSVC_SUPPORT) \
+		$(EXTERNAL_PATH)/prepare-external.sh
 else
 	@PREP_AWS_SDK=$(S3_SUPPORT) AWS_LIB_DIR=$(AWS_LIB_DIR) AWS_INCLUDE_DIR=$(AWS_INCLUDE_DIR) \
-		PREP_MIMALLOC=$(USE_MIMALLOC) $(EXTERNAL_PATH)/prepare-external.sh
+		PREP_MIMALLOC=$(USE_MIMALLOC) PREP_UWS=$(ALTHTTPSVC_SUPPORT) \
+		$(EXTERNAL_PATH)/prepare-external.sh
 endif
 
 features-info:
@@ -225,11 +276,6 @@ ifeq ($(CUDA_SUPPORT),1)
 else
 	$(info [OPT] CUDA support disabled)
 endif
-ifeq ($(BACKTRACE_SUPPORT),1)
-	$(info [OPT] Backtrace support enabled)
-else
-	$(info [OPT] Backtrace support disabled)
-endif
 ifeq ($(S3_SUPPORT),1)
 	$(info [OPT] S3 support enabled)
 else
@@ -239,6 +285,19 @@ ifeq ($(USE_MIMALLOC),1)
 	$(info [OPT] mimalloc enabled)
 else
 	$(info [OPT] mimalloc disabled)
+endif
+ifeq ($(ALTHTTPSVC_SUPPORT),1)
+	$(info [OPT] Alternative HTTP service enabled)
+else
+	$(info [OPT] Alternative HTTP service disabled)
+endif
+ifeq ($(HDFS_SUPPORT),1)
+	$(info [OPT] HDFS support enabled. (HADOOP_HOME: $(HADOOP_HOME); JAVA_HOME: $(JAVA_HOME)))
+else
+	$(info [OPT] HDFS support disabled)
+endif
+ifneq ($(NCURSES_SUPPORT),1)
+	$(info [OPT] ncurses disabled)
 endif
 
 clean: clean-packaging clean-buildhelpers
@@ -254,11 +313,13 @@ endif
 clean-externals:
 ifdef BUILD_VERBOSE
 	rm -rf $(EXTERNAL_PATH)/Simple-Web-Server 
+	rm -rf $(EXTERNAL_PATH)/uWebSockets 
 	rm -rf $(EXTERNAL_PATH)/aws-sdk-cpp $(EXTERNAL_PATH)/aws-sdk-cpp_install
 	rm -rf $(EXTERNAL_PATH)/mimalloc
 else
 	@echo "[DELETE] EXTERNALS"
 	@rm -rf $(EXTERNAL_PATH)/Simple-Web-Server
+	@rm -rf $(EXTERNAL_PATH)/uWebSockets 
 	@rm -rf $(EXTERNAL_PATH)/aws-sdk-cpp $(EXTERNAL_PATH)/aws-sdk-cpp_install
 	@rm -rf $(EXTERNAL_PATH)/mimalloc
 endif
@@ -365,9 +426,10 @@ deb: | prepare-buildroot
 	sed -i "s/__NAME__/$(EXE_NAME)/" $(PACKAGING_PATH)/BUILDROOT/debian/control
 	
 	cd $(PACKAGING_PATH)/BUILDROOT && \
-		EDITOR=/bin/true VISUAL=/bin/true debchange --create --package elbencho --urgency low \
-			--noquery --newversion "$(EXE_VER_MAJOR).$(EXE_VER_MINOR).$(EXE_VER_PATCHLEVEL)" \
-			"Custom package build."
+	EDITOR=/bin/true VISUAL=/bin/true DEBEMAIL=elbencho@localhost.localdomain debchange --create \
+		--package elbencho --urgency low --noquery \
+		--newversion "$(EXE_VER_MAJOR).$(EXE_VER_MINOR).$(EXE_VER_PATCHLEVEL)" \
+		"Custom package build."
 	
 	cd $(PACKAGING_PATH)/BUILDROOT && \
 		debuild -b -us -uc
@@ -381,6 +443,8 @@ version:
 
 help:
 	@echo 'Optional Build Features:'
+	@echo '   ALTHTTPSVC_SUPPORT=0|1  - Build with support for alternative HTTP service.'
+	@echo '                             (Default: 0)'
 	@echo '   BACKTRACE_SUPPORT=0|1   - Build with backtrace support. (Default: 1)'
 	@echo '   CUDA_SUPPORT=0|1        - Manually enable (=1) or disable (=0) support for'
 	@echo '                             CUDA to work with GPU memory. By default, CUDA'
@@ -393,26 +457,43 @@ help:
 	@echo '                             libcufile.so)'
 	@echo '   CYGWIN_SUPPORT=0|1      - Reduce build features to enable build in Cygwin'
 	@echo '                             environment. (Default: 0)'
+	@echo '   HDFS_SUPPORT=0|1        - Build with support for Hadoop HDFS. HADOOP_HOME'
+	@echo '                             and JAVA_HOME need to be set correctly so that'
+	@echo '                             $$HADDOP_HOME/include/hdfs.h and'
+	@echo '                             $$JAVA_HOME/lib/server/libjvm.so can be found.'
+	@echo '                             (Default: 0)'
+	@echo '   NCURSES_SUPPORT=0|1     - Link against ncurses for fullscreen live stats'
+	@echo '                             support. (Default: 1)'
+	@echo '   S3_SUPPORT=0|1          - Build with S3 support. This will fetch a AWS SDK'
+	@echo '                             git repo of over 1GB size. (Default: 0)'
 	@echo '   USE_MIMALLOC=0|1        - Use Microsoft mimalloc library for memory'
 	@echo '                             allocation management. Recommended when using'
 	@echo '                             musl-libc. (Default: 0)'
-	@echo '   S3_SUPPORT=0|1          - Build with S3 support. This will fetch a AWS SDK'
-	@echo '                             git repo of over 1GB size. (Default: 0)'
 	@echo
 	@echo 'Optional Compile/Link Arguments:'
-	@echo '   CXX=<string>            - Path to alternative C++ compiler. (Default: g++)'
-	@echo '   CXX_FLAVOR=<string>     - C++ standard compiler flag. (Default: c++14)'
-	@echo '   CXXFLAGS_EXTRA=<string> - Additional C++ compiler flags.'
-	@echo '   LDFLAGS_EXTRA=<string>  - Additional linker flags.'
 	@echo '   BUILD_VERBOSE=1         - Enable verbose build output.'
 	@echo '   BUILD_STATIC=1          - Generate a static binary without dependencies.'
 	@echo '                             (Tested only on Alpine Linux.)'
 	@echo '   BUILD_DEBUG=1           - Include debug info in executable.'
-	@echo '   AWS_LIB_DIR=<path>      - If this is set in combination with S3_SUPPORT=1'
-	@echo '                             then link against pre-built libs in given dir'
-	@echo '                             instead of building the AWS SDK CPP.'
-	@echo '   AWS_INCLUDE_DIR=<path>  - Include files path for AWS_LIB_DIR. (Default: '
-	@echo '                             "/usr/include")'
+	@echo '   CXX=<string>            - Path to alternative C++ compiler. (Default: g++)'
+	@echo '   CXX_FLAVOR=<string>     - C++ standard compiler flag. (Default: c++17)'
+	@echo '   CXXFLAGS_EXTRA=<string> - Additional C++ compiler flags.'
+	@echo '   LDFLAGS_EXTRA=<string>  - Additional linker flags.'
+	@echo
+	@echo 'Include and library paths:'
+	@echo '   AWS_LIB_DIR=<path>         - If this is set in combination with S3_SUPPORT=1'
+	@echo '                                then link against pre-built libs in given dir'
+	@echo '                                instead of building the AWS SDK CPP.'
+	@echo '   AWS_INCLUDE_DIR=<path>     - Include files path for AWS_LIB_DIR.'
+	@echo '                                (Default: /usr/include")'
+	@echo '   CUDA_INCLUDE_PATH=<path>   - Path to directory containing cuda_runtime.h.'
+	@echo '                                (Default: search under /usr/local/cuda*")'
+	@echo '   CUDA_LIB_PATH=<path>       - Path to directory containing libcudart.so.'
+	@echo '                                (Default: search under /usr/local/cuda*")'
+	@echo '   CUFILE_INCLUDE_PATH=<path> - Path to directory containing cufile.h.'
+	@echo '                                (Default: search under /usr/local/cuda*")'
+	@echo '   CUFILE_LIB_PATH=<path>     - Path to directory containing libcufile.so.'
+	@echo '                                (Default: search under /usr/local/cuda*")'
 	@echo
 	@echo 'Targets:'
 	@echo '   all (default)     - Build executable'

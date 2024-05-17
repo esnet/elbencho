@@ -46,7 +46,7 @@ You can get elbencho pre-built for Linux & Windows from the [Releases section](h
 
 ## Build Prerequisites
 
-Building elbencho requires a C++14 compatible compiler, such as gcc version 5.x or higher.
+Building elbencho requires a C++17 compatible compiler, such as gcc version 7.x or higher.
 
 ### Dependencies for Debian/Ubuntu
 
@@ -115,7 +115,7 @@ Instead of giving benchmark parameters on the command line, you can also use a c
 
 ### Results & Charts
 
-Elbencho presents two result columns: One showing the status when the first I/O thread finished its work and one for the end result when the last thread finished its work. Ideally, both are close together.
+Elbencho presents two result columns: One showing the aggregate status at the point in time when the fastest I/O thread finished its work ("First Done") and one for the aggregate end result at the point in time when the slowest thread finished its work ("Last Done"). Ideally, both are close together.
 
 To generate charts from your result series, e.g. based on different block sizes or different thread counts, use elbencho's csv file option (`--csvfile`) and the `elbencho-chart` tool to easily generate a chart from your csv file. Alternatively, spreadsheet tools like Microsoft Excel or Google Sheets can be used for this.
 
@@ -142,7 +142,7 @@ Enabling S3 Object Storage support will automatically download a AWS SDK git rep
 ##### S3 Dependencies for RHEL/CentOS 8.0 or newer
 
 ```bash
-sudo yum install cmake libarchive libcurl-devel openssl-devel libuuid-devel
+sudo yum install cmake libarchive libcurl-devel openssl-devel libuuid-devel zlib zlib-devel
 ```
 
 ##### S3 Dependencies for Ubuntu 20.04 or newer
@@ -153,7 +153,26 @@ sudo apt install cmake libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev
 
 ##### Build elbencho with S3 Support
 
+The static Linux executable in the [Releases section](https://github.com/breuner/elbencho/releases) includes S3 support, in case you prefer to use this instead of building your own version.
+
 To build elbencho with S3 support, just add the `S3_SUPPORT=1` parameter to the make command. (If you previously built elbencho without S3 support, then run `make clean-all` before this.)
+
+The S3 support of elbencho is based on Amazon's AWS SDK CPP. Thus, you either need to provide it or elbencho needs to download and build it.
+
+<ins>Option A</ins>: If you prefer to provide your own version of the AWS SDK CPP instead of having elbencho download it, then here is an example of a cmake command to generate an SDK that is compatible with elbencho and the corresponding elbencho build command:
+
+```bash
+# In the AWS SDK build dir:
+cmake ../aws-sdk-cpp -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/usr/local/ -DCMAKE_INSTALL_PREFIX=/usr/local/ -DBUILD_ONLY="s3;transfer" -DAUTORUN_UNIT_TESTS=OFF -DENABLE_TESTING=OFF -DBYO_CRYPTO=ON -DBUILD_SHARED_LIBS=OFF
+
+make -j $(nproc)
+sudo make install
+
+# In the elbencho git clone top level dir:
+make -j $(nproc) S3_SUPPORT=1 AWS_INCLUDE_DIR=/usr/local/include/ AWS_LIB_DIR=/usr/local/lib64/
+```
+
+<ins>Option B</ins>: If you are not sure whether you can provide a compatible build of the SDK or if you just generally prefer to have elbencho take care of the AWS SDK CPP build then use this command:
 
 ```bash
 make S3_SUPPORT=1 -j $(nproc)

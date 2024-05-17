@@ -2,6 +2,7 @@
 #define COMMON_H_
 
 #include <boost/config.hpp> // for BOOST_LIKELY
+#include <cstdint>
 #include <list>
 #include <set>
 #include <string>
@@ -35,6 +36,11 @@ typedef std::vector<uint64_t> UInt64Vec;
 #define PHASENAME_STATFILES		"STAT"
 #define PHASENAME_LISTOBJECTS	"LISTOBJ"
 #define PHASENAME_LISTOBJPAR	"LISTOBJ_P"
+#define PHASENAME_MULTIDELOBJ	"MULTIDEL"
+#define PHASENAME_PUTOBJACL		"PUTOBJACL"
+#define PHASENAME_GETOBJACL		"GETOBJACL"
+#define PHASENAME_PUTBUCKETACL	"PUTBACL"
+#define PHASENAME_GETBUCKETACL	"GETBACL"
 
 
 // human-readable entry type in current benchmark phase
@@ -47,7 +53,7 @@ typedef std::vector<uint64_t> UInt64Vec;
  * (Only exact matches are assumed to be compatible, that's why this can differ from the program
  * version.)
  */
-#define HTTP_PROTOCOLVERSION	"2.0.14"
+#define HTTP_PROTOCOLVERSION	"3.0.4"
 
 /**
  * Default access mode bits for new files.
@@ -81,10 +87,13 @@ typedef std::vector<uint64_t> UInt64Vec;
 	} while(0)
 
 
+// tell the compiler that a code path is likely/unlikely to optimize performance of "good" paths
 #ifdef BOOST_UNLIKELY
 	#define IF_UNLIKELY(condition)	if(BOOST_UNLIKELY(condition) )
+	#define IF_LIKELY(condition)	if(BOOST_LIKELY(!!(condition) ) )
 #else // fallback for older boost versions
 	#define IF_UNLIKELY(condition)	if(__builtin_expect(condition, 0) )
+	#define IF_LIKELY(condition)	if(__builtin_expect(!!(condition), 1) )
 #endif
 
 
@@ -105,6 +114,11 @@ enum BenchPhase
 	BenchPhase_STATFILES,
 	BenchPhase_LISTOBJECTS,
 	BenchPhase_LISTOBJPARALLEL,
+	BenchPhase_MULTIDELOBJ,
+	BenchPhase_PUTOBJACL,
+	BenchPhase_GETOBJACL,
+	BenchPhase_PUTBUCKETACL,
+	BenchPhase_GETBUCKETACL,
 };
 
 
@@ -148,6 +162,7 @@ typedef std::vector<BenchPathInfo> BenchPathInfoVec;
 #define XFER_STATS_BENCHPHASECODE				"PhaseCode"
 #define XFER_STATS_NUMWORKERSDONE				"NumWorkersDone"
 #define XFER_STATS_NUMWORKERSDONEWITHERR		"NumWorkersDoneWithError"
+#define XFER_STATS_TRIGGERSTONEWALL				"TriggerStoneWall"
 #define XFER_STATS_NUMENTRIESDONE 				"NumEntriesDone"
 #define XFER_STATS_NUMBYTESDONE 				"NumBytesDone"
 #define XFER_STATS_NUMIOPSDONE 					"NumIOPSDone"
@@ -158,6 +173,14 @@ typedef std::vector<BenchPathInfo> BenchPathInfoVec;
 #define XFER_STATS_ELAPSEDUSECLIST_ITEM			"ElapsedUSecList.item"
 #define XFER_STATS_ELAPSEDSECS 					"ElapsedSecs"
 #define XFER_STATS_ERRORHISTORY					XFER_PREP_ERRORHISTORY
+#define XFER_STATS_LAT_NUM_IOPS					"NumIOLatUSec"
+#define XFER_STATS_LAT_SUM_IOPS					"SumIOLatUSec"
+#define XFER_STATS_LAT_NUM_IOPS_RWMIXREAD		"NumIOLatUSecRWMixRead"
+#define XFER_STATS_LAT_SUM_IOPS_RWMIXREAD		"SumIOLatUSecRWMixRead"
+#define XFER_STATS_LAT_NUM_ENTRIES				"NumEntLatUSec"
+#define XFER_STATS_LAT_SUM_ENTRIES				"SumEntLatUSec"
+#define XFER_STATS_LAT_NUM_ENTRIES_RWMIXREAD	"NumEntLatUSecRWMixRead"
+#define XFER_STATS_LAT_SUM_ENTRIES_RWMIXREAD	"SumEntLatUSecRWMixRead"
 #define XFER_STATS_LAT_PREFIX_IOPS				"IOPS_"
 #define XFER_STATS_LAT_PREFIX_ENTRIES			"Entries_"
 #define XFER_STATS_LAT_PREFIX_IOPS_RWMIXREAD	"IOPSRWMixRead_"

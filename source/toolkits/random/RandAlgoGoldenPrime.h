@@ -7,6 +7,7 @@
 #include "RandAlgoXoshiro256ss.h"
 
 #define RANDALGO_GOLDEN_RATIO_PRIME		0x9e37fffffffc0001UL
+#define RANDALGO_GOLDEN_RESEED_SIZE		(256*1024)
 
 /**
  * Fast but weak random number generator based on simple multiplication and shifting of 64bits of
@@ -24,6 +25,11 @@ class RandAlgoGoldenPrime : public RandAlgoInterface
 			state = stateSeeder.next();
 		}
 
+		RandAlgoGoldenPrime(uint64_t seed)
+		{
+			state = seed;
+		}
+
 		virtual ~RandAlgoGoldenPrime() {}
 
 	private:
@@ -39,8 +45,34 @@ class RandAlgoGoldenPrime : public RandAlgoInterface
 
 		virtual void fillBuf(char* buf, uint64_t bufLen) override
 		{
-			reseed(); // reseed with better random number once per buffer
+			size_t numBytesDone = 0;
+			uint64_t chunkLen;
 
+			// loop to reseed with better random number every RANDALGO_GOLDEN_RESEED_SIZE
+			while( (chunkLen = (bufLen - numBytesDone) ) >= (RANDALGO_GOLDEN_RESEED_SIZE) )
+			{
+				reseed();
+
+				fillBufNoReseed(buf, chunkLen);
+
+				buf += chunkLen;
+				numBytesDone += chunkLen;
+			}
+
+			// reseed and fill remainder of less than RANDALGO_GOLDEN_RESEED_SIZE
+			// (note: this is also relevant if bufLen was smaller than RANDALGO_GOLDEN_RESEED_SIZE)
+
+			reseed();
+
+			fillBufNoReseed(buf, bufLen - numBytesDone);
+		}
+
+		/**
+		 * Fill buffer without any reseeds from stronger random generator. This is typically only
+		 * useful with a limited buffer len and logic to reseed occasionally.
+		 */
+		void fillBufNoReseed(char* buf, uint64_t bufLen)
+		{
 			size_t numBytesDone = 0;
 
 			for(uint64_t i=0; i < (bufLen / sizeof(uint64_t) ); i++)

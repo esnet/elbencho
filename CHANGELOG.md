@@ -1,14 +1,146 @@
 # Changelog of elbencho
 
-## v2.1.6 (work in progress)
+## v3.0.8 (work in progress)
+
+### New Features & Enancements
+* Added options to read and stat files immediately after creation while they are still open. (See "--readinline" and "--statinline".)
+* Added option to sleep between test phases. (See "--phasedelay".)
+* Added option to rotate hosts list for service instances between phases to avoid caching effects. (See "--rotatehosts".)
+* Added support for S3 object and bucket ACL PUT/GET. (See "--s3aclput", "--s3baclput".)
+* Added new ops log to log all IO operations (open, read, ...). (See "--opslog").
 
 ### General Changes
-* When using S3 option "--s3randobj", show IOPS in addition to throughput.
+* Timestamps in csv files now include milliseconds for higher precisiomn.
+* Updated S3 to latest AWS SDK CPP v1.11.319.
+
+### Contributors
+Thanks to Casey Peel for code contributions. Thanks to Andy Black and Github user mhanafi1970 for helpful comments and suggestions.
+
+## v3.0.7 (March 21, 2024)
+
+### New Features & Enancements
+* Added new multi-arch (ARM64 & x86_64) docker container with CUDA/GDS support.
+* If an S3 object prefix contains a sequence of three or more '%' chars, this sequence will now get replaced by a random hex string of the same length.
+* New option to specify a custom path and prefix for AWS S3 SDK log file: "--s3logprefix".
+
+### Contributors
+* Thanks to Phil Canman, Erez Binia, Ohad Shamir and Erez Horev for helpful comments and suggestions.
+
+## v3.0.5 (Jan 05, 2024)
+
+### New Features & Enhancements
+* Square brackets can now be used to define number lists and ranges in paths, host lists, S3 endpoints.
+    * Examples:
+        * 4 different files (myfile1, myfile2, ...): `elbencho -w /data/myfile[1-4]`
+        * Specify two different hosts (node001, node002): `elbencho --hosts node00[1,2]`
+        * Specify 2x5=10 different S3 servers (192.168.1.1, 192.168.2.1, ...): `elbencho --s3endpoints http://192.168.[1,2].[1,3,5-7]`
+
+### General Changes
+* Use latest Alpine Linux 3.x for Alpine-based docker containers instead of always 3.14.
+* Support building without fullscreen live stats to avoid ncurses dependency. ("make NCURSES_SUPPORT=0").
+
+### Contributors
+* Thanks to Eyal Rif and Oz Perry for helpful comments and suggestions.
+
+## v3.0.3 (Nov 11, 2023)
+
+### New Features & Enhancements
+* Block variance to defeat compression is now also effective for writes from GPUs.
+* Makefile now provides options to manually specify CUDA include and library paths.
+* Added support for S3 multi-delete (S3 DeleteObjects) operation. See new option "--s3multidel".
+
+### General Changes
+* S3 error messages now also show HTTP error code.
+* Use latest Alpine Linux 3.x for static builds instead of always 3.14.
+* Core binding arguments now support "all" as value: "--zones all" & "--cores all".
+* GPU list argument now supports "all" as value: "--gpuids all".
+* Added cygserver.exe to Windows .zip package to speed up Active Directory lookups.
+
+### Fixes
+* elbencho-chart tool now also works with csv files created via "--livecsv".
+
+### Contributors
+* Thanks to Bob Holmes and Github user bolochavaez for code contributions. Thanks to Prabhjyot Singh Saluja, David Johnson, Erez Zilber, Dima Persov, Omri Zedan, Andy Black for helpful comments and suggestions.
+
+## v3.0.1 (Aug 08, 2023)
+
+### New Features & Enhancements
+* Added N-to-M network bandwidth test. See new option "--netbench".
+* Added support for memory mapped IO (aka mmap). See new option "--mmap".
+* Added support for file access hints via fadvise. See new option "--fadv".
+* Added support for mmap access hints via madvise. See new option "--madv".
+
+### General Changes
+* Updated S3 to latest AWS SDK CPP v1.11.102.
+* Updated mimalloc memory allocation library to latest version 2.1.2.
+
+### Fixes
+* Fixed compilation error (missing include directive) when building without S3 support.
+* Fixed check for file slice smaller than block size in situations without direct IO.
+* Fixed missing random IO flag in config file example.
+* Fixed Windows build not listening for TCP/IPv4 connections in service mode. 
+
+### Contributors
+* Thanks to Glenn K. Lockwood, Avi Drabkin, Michael Bertelson for reporting issues. Thanks to Jan Heichler, Rob Mallory, Maria Gutierrez for helpful comments and suggestions.
+
+## v2.3.1 (Apr 10, 2023)
+
+### New Features & Enhancements
+* Added support for Hadoop HDFS through the offical libhdfs. See new option "--hdfs".
+* Added average latency to live statistics. Will be shown in "--livecsv" and in fullscreen live stats when "--lat" is given as argument.
+
+### General Changes
+* Improved help text for distributed tests ("--help-dist").
+* Improved speed of directory creation in custom tree mode by making each worker only create a subset of the dirs.
+* Elapsed time is shown more human-friendly in phase results table and in live statistics. (Hours and minutes instead of previously only seconds and milliseconds.)
+* Improved error message when existing CSV file fails compatibility check.
+
+### Contributors
+* Thanks to Leon Clayton, Andy Black, Roger Goff, John Legato for helpful comments and suggestions.
+
+## v2.2.5 (Dec 04, 2022)
+
+### New Features & Enhancements
+* New option "--svcelapsed" shows service instances ordered by completion time of their slowest thread to make it easier to see if some services are always slower/faster than others.
+
+### Contributors
+* Thanks to Samuel Fulcomer for helpful comments and suggestions.
+
+## v2.2.3 (Sep 18, 2022)
+
+### New Features & Enhancements
+* Block variance algo "balanced" has been replaced with a new vectorized SIMD version to enable fast fill of buffers with higher quality random values ("--blockvaralgo"). The previous version still exists as "balanced_single" and remains the default for "--randalgo".
+
+### General Changes
+* Updated S3 to latest AWS SDK CPP v1.9.343. This adds compatibility with Ubuntu 22.04.
+* Block variance algo "fast" now gets reseeded every 256KiB at the latest to improve quality of generated random numbers.
+
+### Fixes
+* Set alpine 3.14 (instead of latest available 3.x) as exact version for static executable, as 3.15 & 3.16 produced executables that were not usable in service mode when trying to connect.
+
+## v2.2.1 (Sep 08, 2022)
+
+### Important Note
+Blocks now get filled with randomized data before each write ("--blockvarpct 100"). This is to prevent unintended effects on storage systems that have compression, deduplication or similar technology enabled. The generation of randomized data can slightly increase CPU utilization and latency for writes, but this increase is presumably neglectable in typical test cases.
+
+### New Features & Enhancements
+* Added support for an alternative HTTP service framework as compile-time and runtime option. ("elbencho --service --althttpsvc" enables the alternative framework at runtime when built with "ALTHTTPSVC_SUPPORT=1".)
+* Added script to cross-compile static arm64 executable on x86_64 platform. ("build_arm64_static_local.sh")
+* New option "--live1n" to print single-line live statistics to a new line on stderr on each update instead of updating in-place like "--live1" does.
+
+### General Changes
+* When using S3 option "--s3randobj" then show IOPS in addition to throughput.
 * Added new Nvidia CUDA repo keys to MagnumIO docker container.
-* When "--rand" is specified in S3 write phase then automatically fall back "--backward" instead of refusing to run.
+* When "--rand" is specified in S3 write phase then automatically use "--backward" instead of refusing to run.
+* Building elbencho now requires a C++17 compatible compiler.
+* Changed block variance percentage default to 100 ("--blockvarpct 100"). Previous default was 0.
+
+### Contributors
+* Thanks to Peter Grossoehme, Rob Mallory, Darren Miller and Sascha Kuebart for helpful comments and suggestions.
 
 ### Fixes
 * Removed variables in comments of RPM spec template file for compatibility with RHEL9.
+* Windows executable used wrong allocation block size in stat() info, leading to a note on the console about files possibly being sparse or compressed although they were not.
 
 ## v2.1.5 (Apr 30, 2022)
 

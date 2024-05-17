@@ -6,6 +6,7 @@
 #include <libgen.h>
 #include <string>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "ProgArgs.h"
@@ -17,16 +18,19 @@
 #include "toolkits/UnitTk.h"
 
 #ifdef CUFILE_SUPPORT
+	#include <cuda_runtime.h>
 	#include <cufile.h>
 #endif
 
 #define DIRECTIO_MINSIZE			512 // min size in bytes for direct IO
+
 #define BENCHPATH_DELIMITER			",\n\r@" // delimiters for user-defined bench dir paths
 #define HOSTLIST_DELIMITERS			", \n\r" // delimiters for hosts string (comma or space)
 #define HOST_PORT_SEPARATOR			":" // separator for hostname:port
 #define ZONELIST_DELIMITERS			", " // delimiters for numa zones string (comma or space)
 #define GPULIST_DELIMITERS			", \n\r" // delimiters for gpuIDs string
 #define S3ENDPOINTS_DELIMITERS		", \n\r" // delimiters for S3 endpoints list string
+#define NETDEV_DELIMITERS			", \n\r" // delimiters for net dev list string
 
 #define ENDL						<< std::endl << // just to make help text print lines shorter
 
@@ -34,6 +38,16 @@
 #define FILESHAREBLOCKFACTOR_STR	STRINGIZE(FILESHAREBLOCKFACTOR)
 
 #define CSVFILE_EXPECTED_COMMAS		54 // to check if existing csv was written with other version
+
+#define NETBENCH_PORT_OFFSET		1000 // offset from service port for netbench listen socket
+#define NETBENCH_PORT_OFFSET_STR	STRINGIZE(NETBENCH_PORT_OFFSET)
+
+#define NUMAZONES_ALL_ARG			"all" // shortcut for user to select all numa zones
+#define CPUCORES_ALL_ARG			"all" // shortcut for user to select all cpu cores
+#define GPUIDS_ALL_ARG				"all" // shortcut for user to select all gpus
+
+#define AWS_SDK_LOGPREFIX_DEFAULT	"aws_sdk_"
+
 
 /**
  * Constructor.
@@ -118,6 +132,9 @@ ProgArgs::~ProgArgs()
 	for(CuFileHandleData& cuFileHandleData : cuFileHandleDataVec)
 			cuFileHandleData.deregisterHandle();
 
+	for(char* mmapPtr : mmapVec)
+		munmap(mmapPtr, fileSize);
+
 #ifdef CUFILE_SUPPORT
 	if(isCuFileDriverOpen)
 		cuFileDriverClose();
@@ -143,30 +160,46 @@ void ProgArgs::defineAllowedArgs()
 		(ARG_HELPALLOPTIONS_LONG, "Print all available options help message.")
 	;
 
-    // alphabetic order to print help in alphabetical order
+    // ordered by user option strings to print user help in alphabetical order
     argsGenericDescription.add_options()
 /*al*/	(ARG_SHOWALLELAPSED_LONG, bpo::bool_switch(&this->showAllElapsed),
 			"Show elapsed time to completion of each I/O worker thread.")
+#ifdef ALTHTTPSVC_SUPPORT
+/*al*/	(ARG_ALTHTTPSERVER_LONG, bpo::bool_switch(&this->useAlternativeHTTPService),
+			"Use alternative implementation of HTTP service (for testing).")
+#endif // ALTHTTPSVC_SUPPORT
 /*b*/	(ARG_BLOCK_LONG "," ARG_BLOCK_SHORT, bpo::value(&this->blockSizeOrigStr),
-			"Number of bytes to read/write in a single operation. (Default: 1M)")
+			"Number of bytes to read/write in a single operation. (Default: 1M; "
+			"supports base2 suffixes, e.g. \"2M\")")
 /*ba*/	(ARG_REVERSESEQOFFSETS_LONG, bpo::bool_switch(&this->doReverseSeqOffsets),
 			"Do backwards sequential reads/writes.")
 /*bl*/	(ARG_BLOCKVARIANCEALGO_LONG, bpo::value(&this->blockVarianceAlgo),
 			"Random number algorithm for \"--" ARG_BLOCKVARIANCE_LONG "\". Values: \""
-			RANDALGO_FAST_STR "\" for high speed but weaker randomness; \"" RANDALGO_BALANCED_STR
-			"\" for good balance of speed and randomness; \"" RANDALGO_STRONG_STR "\" for high CPU "
-			"cost but strong randomness. (Default: " RANDALGO_FAST_STR ")")
+			RANDALGO_FAST_STR "\" for high speed but weaker randomness; \""
+			RANDALGO_BALANCED_SIMD_STR "\" for good balance of speed and randomness; \""
+			RANDALGO_STRONG_STR "\" for high CPU cost but strong randomness. "
+			"When GPUs are given then the CUDA default (\"XORWOW\") random generator will be "
+			"used and this value is ignored. "
+			"(Default: " RANDALGO_FAST_STR ")")
 /*bl*/	(ARG_BLOCKVARIANCE_LONG, bpo::value(&this->blockVariancePercent),
-			"Percentage of each block that will be refilled with random data between writes. "
-			"This can be used to defeat compression/deduplication. (Default: 0; Max: 100)")
+			"Block variance percentage. Defines the percentage of each block that will be refilled "
+			"with random data between writes. This can be used to defeat "
+			"compression/deduplication. (Default: 100; Range: 0-100)")
 /*c*/	(ARG_CONFIGFILE_LONG "," ARG_CONFIGFILE_SHORT, bpo::value(&this->configFilePath),
 			"Path to benchmark configuration file. All command line options starting with "
 			"double dashes can be used as \"OPTIONNAME=VALUE\" in the config file. Multiple "
 			"options are newline-separated. Lines starting with \"#\" are ignored.")
+/*cl*/	(ARG_CLIENTS_LONG, bpo::value(&this->clientsStr),
+			"Comma-separated list of service hosts to use as clients in netbench mode. "
+			"(Format: hostname[:port])")
+/*cl*/	(ARG_CLIENTSFILE_LONG, bpo::value(&this->clientsFilePath),
+			"Path to file containing line-separated service hosts to use as clients in netbench "
+			"mode. (Format: hostname[:port])")
 #ifdef COREBIND_SUPPORT
 /*co*/	(ARG_CPUCORES_LONG, bpo::value(&this->cpuCoresStr),
 			"Comma-separated list of CPU cores to bind this process to. If multiple cores are "
-			"given, then worker threads are bound round-robin to the cores. "
+			"given, then worker threads are bound round-robin to the cores. The special value "
+			"\"" CPUCORES_ALL_ARG "\" is short for the list of all available CPU cores."
 			"(Hint: See 'lscpu' for available CPU cores.)")
 #endif // COREBIND_SUPPORT
 /*cp*/	(ARG_CPUUTIL_LONG, bpo::bool_switch(&this->showCPUUtilization),
@@ -213,6 +246,9 @@ void ProgArgs::defineAllowedArgs()
 /*F*/	(ARG_DELETEFILES_LONG "," ARG_DELETEFILES_SHORT,
 			bpo::bool_switch(&this->runDeleteFilesPhase),
 			"Delete files.")
+/*fa*/	(ARG_FADVISE_LONG, bpo::value(&this->fadviseFlagsOrigStr),
+			"Provide file access hints via fadvise(). This value is a comma-separated list of the "
+			"following flags: seq, rand, willneed, dontneed, noreuse.")
 /*fo*/	(ARG_FOREGROUNDSERVICE_LONG, bpo::bool_switch(&this->runServiceInForeground),
 			"When running as service, stay in foreground and connected to console instead of "
 			"detaching from console and daemonizing into backgorund.")
@@ -230,10 +266,21 @@ void ProgArgs::defineAllowedArgs()
 			"to/from GPU buffers. GPU IDs will be assigned round robin to different threads. "
 			"When this is given in service mode then the given list will override any list given "
 			"by the master, which can be used to bind specific service instances to specific GPUs. "
-			"(Hint: CUDA GPU IDs are 0-based.)")
+			"The special value \"" GPUIDS_ALL_ARG "\" is short for the list of all available GPUs. "
+			"(Hint: CUDA GPU IDs are 0-based; see 'nvidia-smi' for available GPU IDs.)")
 /*gp*/	(ARG_GPUPERSERVICE_LONG, bpo::bool_switch(&this->assignGPUPerService),
 			"Assign GPUs round robin to service instances (i.e. one GPU per service) instead of "
 			"default round robin to threads (i.e. multiple GPUs per service, if multiple given).")
+#endif
+#ifdef HDFS_SUPPORT
+/*hd*/	(ARG_HDFS_LONG, bpo::bool_switch(&this->useHDFS),
+			"Use Hadoop HDFS through the official libhdfs. Make sure that CLASSPATH contains "
+			"Hadoop XML conf files dir as first value, so that connecting to the \"default\" HDFS "
+			"instance works. This can only be used with \"-" ARG_NUMDIRS_SHORT "\" & \"-"
+			ARG_NUMFILES_SHORT "\" and a single dir given as argument. (Hint: You might need to "
+			"set these environment variables: CLASSPATH=\"$(hadoop classpath)\" "
+			"LD_LIBRARY_PATH=\"$JAVA_HOME/lib/server:$HADOOP_HOME/lib/native\" "
+			"LIBHDFS_OPTS=\"-Xrs -Xms20g\".)")
 #endif
 /*ho*/	(ARG_HOSTS_LONG, bpo::value(&this->hostsStr),
 			"Comma-separated list of hosts in service mode for coordinated benchmark. When this "
@@ -241,8 +288,8 @@ void ProgArgs::defineAllowedArgs()
 			"service mode hosts. The given number of threads, dirs and files is per-host then. "
 			"(Format: hostname[:port])")
 /*ho*/	(ARG_HOSTSFILE_LONG, bpo::value(&this->hostsFilePath),
-			"Path to file containing line-separated service hosts to use for benchmark. (Format: "
-			"hostname[:port])")
+			"Path to file containing line-separated service hosts to use for benchmark. Lines "
+			"starting with \"#\" will be ignored. (Format: hostname[:port])")
 /*i*/	(ARG_ITERATIONS_LONG "," ARG_ITERATIONS_SHORT, bpo::value(&this->iterations),
 			"Number of iterations to run the benchmark. (Default: 1)")
 /*in*/	(ARG_INFINITEIOLOOP_LONG, bpo::bool_switch(&this->doInfiniteIOLoop),
@@ -271,8 +318,12 @@ void ProgArgs::defineAllowedArgs()
 /*li*/	(ARG_LIMITWRITE_LONG, bpo::value(&this->limitWriteBpsOrigStr),
 			"Per-thread write limit in bytes per second. (In combination with "
 			"\"--" ARG_RWMIXPERCENT_LONG "\" this defines the limit for read+write.)")
-/*liv*/	(ARG_BRIEFLIFESTATS_LONG, bpo::bool_switch(&this->useBriefLiveStats),
-			"Use brief live statistics format, i.e. a single line instead of full screen stats.")
+/*liv*/	(ARG_BRIEFLIVESTATS_LONG, bpo::bool_switch(&this->useBriefLiveStats),
+			"Use brief live statistics format, i.e. a single line instead of full screen stats. "
+			"The line gets updated in-place.")
+/*liv*/	(ARG_LIVESTATSNEWLINE_LONG, bpo::bool_switch(&this->useBriefLiveStatsNewLine),
+			"Use brief live statistics format, i.e. a single line instead of full screen stats. "
+			"A new line is written to stderr for each update.")
 /*liv*/	(ARG_CSVLIVEFILE_LONG, bpo::value(&this->liveCSVFilePath),
 			"Path to file for live progress results in csv format. If the file exists, results "
 			"will be appended. This must not be the same file that is given as \"--"
@@ -286,12 +337,43 @@ void ProgArgs::defineAllowedArgs()
 			"(Default: 2000)")
 /*lo*/	(ARG_LOGLEVEL_LONG, bpo::value(&this->logLevel),
 			"Log level. (Default: 0; Verbose: 1; Debug: 2)")
+/*ma*/	(ARG_MADVISE_LONG, bpo::value(&this->madviseFlagsOrigStr),
+			"When using mmap, provide access hints via madvise(). This value is a comma-separated "
+			"list of the following flags: seq, rand, willneed, dontneed, hugepage, nohugepage.")
+/*mm*/	(ARG_MMAP_LONG, bpo::bool_switch(&this->useMmap),
+			"Do file IO through memory mapping. Mmap writes cannot extend a file beyond its "
+			"current size; if you try this, you will cause a Bus Error (SIGBUS). Thus, you "
+			"typically use mmap writes together with \"--" ARG_TRUNCTOSIZE_LONG "\" or \"--"
+			ARG_PREALLOCFILE_LONG "\". For random read tests, consider using direct IO and adding "
+			"an madvise for random access to disable prefetching. But caching is in the nature of "
+			"how mmap IO works, so direct IO won't disable caching in this case. Note also that "
+			"memory maps count towards the total virtual address limit of a process and "
+			"platform. A typical limit is 128TB, seen as 48 bits virtual address size in "
+			"\"/proc/cpuinfo\".")
 /*N*/	(ARG_NUMFILES_LONG "," ARG_NUMFILES_SHORT, bpo::value(&this->numFilesOrigStr),
 			"Number of files per thread per directory. (Default: 1) Example: \""
 			"-" ARG_NUMTHREADS_SHORT "2 -" ARG_NUMDIRS_SHORT "3 -" ARG_NUMFILES_SHORT "4\" will "
 			"use 2x3x4=24 files.")
 /*n*/	(ARG_NUMDIRS_LONG "," ARG_NUMDIRS_SHORT, bpo::value(&this->numDirsOrigStr),
-			"Number of directories per thread. (Default: 1)")
+			"Number of directories per thread. This can be 0 to disable creation of any subdirs, "
+			"in which case all workers share the given dir. (Default: 1)")
+/*net*/	(ARG_NETBENCH_LONG, bpo::bool_switch(&this->useNetBench),
+			"Run network benchmarking. To simulate the typical storage access request/response "
+			"pattern, each client thread will send blocksized chunks (\"-" ARG_BLOCK_SHORT "\") to "
+			"one of the servers and wait for a reponse of length \"--" ARG_RESPSIZE_LONG "\" bytes "
+			"before transmitting the next block. Client threads will get connected round-robin to "
+			"the given servers. Blocksize larger than response size simulates writes from clients "
+			"to servers, blocksize smaller than response size simulates reads. Client threads use "
+			"filesize as limit for amount of data to send. "
+			"See \"--" ARG_SERVERS_LONG "\" & \"--" ARG_CLIENTS_LONG "\" for how to define servers "
+			"and clients. "
+			"The used network port for data transfer connections will be "
+			"\"--" ARG_SERVICEPORT_LONG "\" plus " NETBENCH_PORT_OFFSET_STR ". "
+			"(Netbench mode defaults to zero block variance.)")
+/*net*/	(ARG_NETDEVS_LONG, bpo::value(&this->netDevsStr),
+			"Comma-separated list of network device names (e.g. \"eth0\") for "
+			"round-robin binding of outgoing (client-side) connections in network benchmark mode. "
+			"Requires root privileges.")
 /*no0*/	(ARG_IGNORE0USECERR_LONG, bpo::bool_switch(&this->ignore0USecErrors),
 			"Do not warn if worker thread completion time is less than 1 microsecond.")
 /*noc*/	(ARG_NOCSVLABELS_LONG, bpo::bool_switch(&this->noCSVLabels),
@@ -306,16 +388,26 @@ void ProgArgs::defineAllowedArgs()
 			"file/bdev separately instead of sharing the same file descriptor among all threads.")
 /*nol*/	(ARG_NOLIVESTATS_LONG, bpo::bool_switch(&this->disableLiveStats),
 			"Disable live statistics on console.")
+/*nop*/	(ARG_NOPATHEXPANSION_LONG, bpo::bool_switch(&this->disablePathBracketsExpansion),
+			"Disable expansion of number lists and ranges in square brackets for given paths.")
 /*nos*/	(ARG_NOSVCPATHSHARE_LONG, bpo::bool_switch(&this->noSharedServicePath),
 			"Benchmark paths are not shared between service instances. Thus, each service instance "
 			"will work on its own full dataset instead of a fraction of the data set.")
 /*nu*/	(ARG_NUMHOSTS_LONG, bpo::value(&this->numHosts),
 			"Number of hosts to use from given hosts list or hosts file. (Default: use all given "
 			"hosts)")
+/*op*/	(ARG_OPSLOGPATH_LONG, bpo::value(&this->opsLogPath),
+			"Absolute path to logfile for all I/O operations (open, read, ...). In service mode, "
+			"the service instances will log their operations locally to the given path. Log is in "
+			"JSON format. (Default: disabled)")
+/*op*/	(ARG_OPSLOGLOCKING_LONG, bpo::bool_switch(&this->useOpsLogLocking),
+			"Use file locking to synchronize appends to \"--" ARG_OPSLOGPATH_LONG "\".")
+/*ph*/	(ARG_PHASEDELAYTIME_LONG, bpo::value(&this->nextPhaseDelaySecs),
+			"Delay between different benchmark phases in seconds. (Default: 0)")
 /*po*/	(ARG_SERVICEPORT_LONG, bpo::value(&this->servicePort),
 			"TCP port of background service. (Default: " ARGDEFAULT_SERVICEPORT_STR ")")
 /*qr*/	(ARG_PREALLOCFILE_LONG, bpo::bool_switch(&this->doPreallocFile),
-			"Preallocate file disk space on creation via posix_fallocate().")
+			"Preallocate file disk space in a write phase via posix_fallocate().")
 /*qu*/	(ARG_QUIT_LONG, bpo::bool_switch(&this->quitServices),
 			"Quit services on given service mode hosts.")
 /*r*/	(ARG_READ_LONG "," ARG_READ_SHORT, bpo::bool_switch(&this->runReadPhase),
@@ -324,9 +416,10 @@ void ProgArgs::defineAllowedArgs()
 			"Read/write at random offsets.")
 /*ra*/	(ARG_RANDSEEKALGO_LONG, bpo::value(&this->randOffsetAlgo),
 			"Random number algorithm for \"--" ARG_RANDOMOFFSETS_LONG "\". Values: \""
-			RANDALGO_FAST_STR "\" for high speed but weaker randomness; \"" RANDALGO_BALANCED_STR
-			"\" for good balance of speed and randomness; \"" RANDALGO_STRONG_STR "\" for high CPU "
-			"cost but strong randomness. (Default: " RANDALGO_BALANCED_STR ")")
+			RANDALGO_FAST_STR "\" for high speed but weaker randomness; \""
+			RANDALGO_BALANCED_SEQUENTIAL_STR "\" for good balance of speed and randomness; \""
+			RANDALGO_STRONG_STR "\" for high CPU cost but strong randomness. "
+			"(Default: " RANDALGO_BALANCED_SEQUENTIAL_STR ")")
 /*ra*/	(ARG_RANDOMALIGN_LONG, bpo::bool_switch(&this->useRandomAligned),
 			"Align random offsets to block size.")
 /*ra*/	(ARG_RANDOMAMOUNT_LONG, bpo::value(&this->randomAmountOrigStr),
@@ -334,9 +427,21 @@ void ProgArgs::defineAllowedArgs()
 			"benchmark path is a file or block device. (Default: Set to file size)")
 /*ra*/	(ARG_RANKOFFSET_LONG, bpo::value(&this->rankOffset),
 			"Rank offset for worker threads. (Default: 0)")
+/*re*/	(ARG_READINLINE_LONG, bpo::bool_switch(&this->doReadInline),
+			"When benchmark path is a directory, read files immediately after write while they are "
+			"still open.")
+/*re*/	(ARG_RECVBUFSIZE_LONG, bpo::value(&this->sockRecvBufSizeOrigStr),
+			"In netbench mode, this sets the receive buffer size of sockets in bytes. "
+			"(Supports base2 suffixes, e.g. \"2M\")")
+/*re*/	(ARG_RESPSIZE_LONG, bpo::value(&this->netBenchRespSizeOrigStr),
+			"Netbench mode server response size in bytes. Servers will send this amount of data as "
+			"response to each received block from a client. (Default: 1; "
+			"supports base2 suffixes, e.g. \"2M\")")
 /*re*/	(ARG_RESULTSFILE_LONG, bpo::value(&this->resFilePath),
 			"Path to file for human-readable results, similar to console output. If the file "
 			"exists, new results will be appended.")
+/*ro*/	(ARG_ROTATEHOSTS_LONG, bpo::value(&this->rotateHostsNum),
+			"Number by which to rotate hosts between phases to avoid caching effects. (Default: 0)")
 /*rw*/	(ARG_RWMIXPERCENT_LONG, bpo::value(&this->rwMixPercent),
 			"Percentage of blocks that should be read in a write phase. (Default: 0; Max: 100)")
 /*rw*/	(ARG_RWMIXTHREADS_LONG, bpo::value(&this->numRWMixReadThreads),
@@ -346,12 +451,37 @@ void ProgArgs::defineAllowedArgs()
 			"In S3 mode, this only works in combination with \"-" ARG_NUMDIRS_SHORT "\" and \"-"
 			ARG_NUMFILES_SHORT "\".")
 /*s*/	(ARG_FILESIZE_LONG "," ARG_FILESIZE_SHORT, bpo::value(&this->fileSizeOrigStr),
-			"File size. (Default: 0)")
+			"File size. (Default: 0; supports base2 suffixes, e.g. \"2M\")")
 #ifdef S3_SUPPORT
+/*s3a*/	(ARG_S3ACLGET_LONG, bpo::bool_switch(&this->runS3AclGet),
+			"Get S3 object ACLs.")
+/*s3a*/	(ARG_S3ACLGRANTEE_LONG, bpo::value(&this->s3AclGrantee),
+			"S3 object ACL grantee.")
+/*s3a*/	(ARG_S3ACLGRANTEETYPE_LONG, bpo::value(&this->s3AclGranteeType),
+			"S3 object ACL grantee type. Possible values: "
+			ARG_S3ACL_GRANTEE_TYPE_ID ", " ARG_S3ACL_GRANTEE_TYPE_EMAIL ", "
+			ARG_S3ACL_GRANTEE_TYPE_URI ", " ARG_S3ACL_GRANTEE_TYPE_GROUP)
+/*s3a*/	(ARG_S3ACLGRANTS_LONG, bpo::value(&this->s3AclGranteePermissions),
+			"S3 object ACL grantee permissions. Comma-separated list of these values: "
+			ARG_S3ACL_PERM_NONE_NAME ", " ARG_S3ACL_PERM_FULL_NAME ", "
+			ARG_S3ACL_PERM_FLAG_READ_NAME ", " ARG_S3ACL_PERM_FLAG_WRITE_NAME ", "
+			ARG_S3ACL_PERM_FLAG_READACP_NAME ", " ARG_S3ACL_PERM_FLAG_WRITEACP_NAME)
+/*s3a*/	(ARG_S3ACLPUT_LONG, bpo::bool_switch(&this->runS3AclPut),
+			"Put S3 object ACLs. This requires definition of grantee, grantee type and "
+			"permissions.")
+/*s3a*/	(ARG_S3ACLVERIFY_LONG, bpo::bool_switch(&this->doS3AclVerify),
+			"Verify S3 object and bucket ACLs based on given grantee, grantee type and "
+			"permissions. This only effective in the corresponding get object or bucket ACL "
+			"phase.")
+/*s3b*/	(ARG_S3BUCKETACLGET_LONG, bpo::bool_switch(&this->runS3BucketAclGet),
+			"Get S3 bucket ACLs.")
+/*s3b*/	(ARG_S3BUCKETACLPUT_LONG, bpo::bool_switch(&this->runS3BucketAclPut),
+			"Put S3 bucket ACLs. This requires definition of grantee, grantee type and "
+			"permissions.")
 /*s3e*/	(ARG_S3ENDPOINTS_LONG, bpo::value(&this->s3EndpointsStr),
-			"Comma-separated list of S3 endpoints. When this argument is used, the given benchmark "
-			"paths are used as bucket names. Also see \"--" ARG_S3ACCESSKEY_LONG "\" & \"--"
-			ARG_S3ACCESSSECRET_LONG "\". (Format: [http(s)://]hostname[:port])")
+			"Comma-separated list of S3 endpoints. When this argument is used, the given "
+			"benchmark paths are used as bucket names. Also see \"--" ARG_S3ACCESSKEY_LONG "\" & "
+			"\"--" ARG_S3ACCESSSECRET_LONG "\". (Format: [http(s)://]hostname[:port])")
 /*s3f*/	(ARG_S3FASTGET_LONG, bpo::bool_switch(&this->useS3FastRead),
 			"Send downloaded objects directly to /dev/null instead of a memory buffer. This option "
 			"is incompatible with any buffer post-processing options like data verification or "
@@ -371,13 +501,27 @@ void ProgArgs::defineAllowedArgs()
 			"\"--" ARG_S3LISTOBJPARALLEL_LONG "\". This requires the dataset to be created with "
 			"the same values for \"-" ARG_NUMDIRS_SHORT "\" and \"-" ARG_NUMFILES_SHORT "\".")
 /*s3l*/	(ARG_S3LOGLEVEL_LONG, bpo::value(&this->s3LogLevel),
-			"Log level of AWS S3 SDK. This will create a log file named \"aws_sdk_DATE.log\" in "
-			"the current working directory. (Default: 0=disabled; Max: 6)")
+			"Log level of AWS S3 SDK. See \"--" ARG_S3LOGFILEPREFIX_LONG "\" for filename. "
+			"(Default: 0=disabled; Max: 6)")
+/*s3l*/	(ARG_S3LOGFILEPREFIX_LONG, bpo::value(&this->s3LogfilePrefix),
+			"Path and filename prefix of AWS S3 SDK log file. \"DATE.log\" will get appended to "
+			"the given filename. "
+			"(Default: \"" AWS_SDK_LOGPREFIX_DEFAULT "\" in current working directory)")
+/*s3m*/	(ARG_S3MULTIDELETE_LONG, bpo::value(&this->runS3MultiDelObjNum),
+			"Delete multiple objects in a single DeleteObjects request. This loops on retrieving "
+			"a chunk of objects from a listing request and then deleting the retrieved set of "
+			"objects in a single request. This makes no assumption about the retrieved object "
+			"names and deletes arbitrary object names in the given bucket(s). The given number is "
+			"the maximum number of objects to retrieve and delete in a single request. 1000 is a "
+			"typical max value. Use \"--" ARG_S3OBJECTPREFIX_LONG "\" to list/delete only objects "
+			"with the given prefix. (Multiple threads will only be effecive if multiple buckets "
+			"are given.)")
 /*s3n*/	(ARG_S3NOMPCHECK_LONG, bpo::bool_switch(&this->ignoreS3PartNum),
 			"Don't check for S3 multi-part uploads exceeding 10,000 parts.")
 /*s3o*/	(ARG_S3OBJECTPREFIX_LONG, bpo::value(&this->s3ObjectPrefix),
 			"S3 object prefix. This will be prepended to all object names when the benchmark path "
-			"is a bucket.")
+			"is a bucket. (A sequence of 3 to 16 \"" RAND_PREFIX_MARKS_SUBSTR "\" chars will be "
+			"replaced by a random hex string of the same length.)")
 /*s3r*/	(ARG_S3RANDOBJ_LONG, bpo::bool_switch(&this->useS3RandObjSelect),
 			"Read at random offsets and randomly select a new object for each S3 block read. Only "
 			"effective in read phase and in combination with \"-" ARG_NUMDIRS_SHORT "\" & \"-"
@@ -394,6 +538,15 @@ void ProgArgs::defineAllowedArgs()
 			"1, but only supports simple sequential downloads. This is incompatible with "
 			"post-processing options similar to \"--" ARG_S3FASTGET_LONG "\".")
 #endif // S3_SUPPORT
+/*se*/	(ARG_SENDBUFSIZE_LONG, bpo::value(&this->sockSendBufSizeOrigStr),
+			"In netbench mode, this sets the send buffer size of sockets in bytes. "
+			"(Supports base2 suffixes, e.g. \"2M\")")
+/*se*/	(ARG_SERVERS_LONG, bpo::value(&this->serversStr),
+			"Comma-separated list of service hosts to use as servers in netbench mode. "
+			"(Format: hostname[:port])")
+/*se*/	(ARG_SERVERSFILE_LONG, bpo::value(&this->serversFilePath),
+			"Path to file containing line-separated service hosts to use as servers in netbench "
+			"mode. (Format: hostname[:port])")
 /*se*/	(ARG_RUNASSERVICE_LONG, bpo::bool_switch(&this->runAsService),
 			"Run as service for distributed mode, waiting for requests from master.")
 /*sh*/	(ARG_FILESHARESIZE_LONG, bpo::value(&this->fileShareSizeOrigStr),
@@ -403,10 +556,15 @@ void ProgArgs::defineAllowedArgs()
 			"(Default: 0, which means " FILESHAREBLOCKFACTOR_STR " x blocksize)")
 /*st*/	(ARG_STATFILES_LONG, bpo::bool_switch(&this->runStatFilesPhase),
 			"Run file stat benchmark phase.")
+/*re*/	(ARG_STATFILESINLINE_LONG, bpo::bool_switch(&this->doStatInline),
+			"When benchmark path is a diretory, stat files immediately after open in a write or "
+			"read phase.")
 /*st*/	(ARG_STARTTIME_LONG, bpo::value(&this->startTime),
 			"Start time of first benchmark in UTC seconds since the epoch. Intended to synchronize "
 			"start of benchmarks on different hosts, assuming they use synchronized clocks. "
 			"(Hint: Try 'date +%s' to get seconds since the epoch.)")
+/*sv*/	(ARG_SHOWSVCELAPSED_LONG, bpo::bool_switch(&this->showServicesElapsed),
+			"Show elapsed time to completion of each service instance ordered by slowest thread.")
 /*sv*/	(ARG_SVCUPDATEINTERVAL_LONG, bpo::value(&this->svcUpdateIntervalMS),
 			"Update retrieval interval for service hosts in milliseconds. (Default: 500)")
 /*sy*/	(ARG_SYNCPHASE_LONG, bpo::bool_switch(&this->runSyncPhase),
@@ -424,7 +582,7 @@ void ProgArgs::defineAllowedArgs()
 			"treefile based on an existing data set. Otherwise, options are similar to \"--"
 			ARG_HELPMULTIFILE_LONG "\" with the exception of file size and number of dirs/files, "
 			"as these are defined in the treefile. (Note: The file list will be split across "
-			"worker threads, but each thread create/delete all of the dirs, so don't use this for "
+			"worker threads, but dir create/delete is not fully parallel, so don't use this for "
 			"dir create/delete performance testing.)")
 /*tr*/	(ARG_TREERANDOMIZE_LONG, bpo::bool_switch(&this->useCustomTreeRandomize),
 			"In custom tree mode: Randomize file order. Default is order by file size.")
@@ -436,8 +594,7 @@ void ProgArgs::defineAllowedArgs()
 			"Truncate files to 0 size when opening for writing.")
 /*tr*/	(ARG_TRUNCTOSIZE_LONG, bpo::bool_switch(&this->doTruncToSize),
 			"Truncate files to given \"--" ARG_FILESIZE_LONG "\" via ftruncate() when opening for "
-			"writing. If the file previously was larger then the remainder is discarded. This flag "
-			"is automatically enabled when \"--" ARG_RANDOMOFFSETS_LONG "\" is given.")
+			"writing. If the file previously was larger then the remainder is discarded.")
 /*ve*/	(ARG_INTEGRITYCHECK_LONG, bpo::value(&this->integrityCheckSalt),
 			"Enable data integrity check. Writes sum of given 64bit salt plus current 64bit offset "
 			"as file or block device content, which can afterwards be verified in a read phase "
@@ -454,7 +611,8 @@ void ProgArgs::defineAllowedArgs()
 #ifdef LIBNUMA_SUPPORT
 /*zo*/	(ARG_NUMAZONES_LONG, bpo::value(&this->numaZonesStr),
 			"Comma-separated list of NUMA zones to bind this process to. If multiple zones are "
-			"given, then worker threads are bound round-robin to the zones. "
+			"given, then worker threads are bound round-robin to the zones. The special value "
+			"\"" NUMAZONES_ALL_ARG "\" is short for the list of all available NUMA zones."
 			"(Hint: See 'lscpu' for available NUMA zones.)")
 #endif // LIBNUMA_SUPPORT
     ;
@@ -498,6 +656,7 @@ void ProgArgs::defineDefaults()
 	this->rankOffset = 0;
 	this->logLevel = Log_NORMAL;
 	this->showAllElapsed = false;
+	this->showServicesElapsed = false;
 	this->liveStatsSleepMS = 2000;
 	this->useRandomOffsets = false;
 	this->useRandomAligned = false;
@@ -527,11 +686,11 @@ void ProgArgs::defineDefaults()
 	this->doPreallocFile = false;
 	this->doDirSharing = false;
 	this->doDirectVerify = false;
-	this->blockVariancePercent = 0;
+	this->blockVariancePercent = 100;
 	this->rwMixPercent = 0;
 	this->useRWMixPercent = false;
 	this->blockVarianceAlgo = RANDALGO_FAST_STR;
-	this->randOffsetAlgo = RANDALGO_BALANCED_STR;
+	this->randOffsetAlgo = RANDALGO_BALANCED_SEQUENTIAL_STR;
 	this->fileShareSize = 0;
 	this->fileShareSizeOrigStr = "0";
 	this->useCustomTreeRandomize = false;
@@ -540,6 +699,7 @@ void ProgArgs::defineDefaults()
 	this->useS3FastRead = false;
 	this->useS3TransferManager = false;
 	this->s3LogLevel = 0;
+	this->s3LogfilePrefix = AWS_SDK_LOGPREFIX_DEFAULT;
 	this->noDirectIOCheck = false;
 	this->runS3ListObjNum = 0;
 	this->runS3ListObjParallel = false;
@@ -551,6 +711,7 @@ void ProgArgs::defineDefaults()
 	this->numRWMixReadThreads = 0;
 	this->useRWMixReadThreads = false;
 	this->useBriefLiveStats = false;
+	this->useBriefLiveStatsNewLine = false;
 	this->useNoFDSharing = false;
 	this->limitReadBps = 0;
 	this->limitReadBpsOrigStr = "0";
@@ -559,6 +720,32 @@ void ProgArgs::defineDefaults()
 	this->numHosts = -1;
 	this->ignoreS3PartNum = false;
 	this->showDirStats = false;
+	this->useAlternativeHTTPService = false;
+	this->useHDFS = false;
+	this->useNetBench = false;
+	this->numNetBenchServers = 0;
+	this->netBenchRespSize = 1;
+	this->netBenchRespSizeOrigStr = "1";
+	this->sockRecvBufSize = 0;
+	this->sockRecvBufSizeOrigStr = "0";
+	this->sockSendBufSize = 0;
+	this->sockSendBufSizeOrigStr = "0";
+	this->useMmap = false;
+	this->fadviseFlags = 0;
+	this->madviseFlags = 0;
+	this->runS3MultiDelObjNum = 0;
+	this->disablePathBracketsExpansion = false;
+	this->useS3ObjectPrefixRand = false;
+	this->doReadInline = false;
+	this->doStatInline = false;
+	this->nextPhaseDelaySecs = 0;
+	this->rotateHostsNum = 0;
+	this->runS3AclPut = false;
+	this->runS3AclGet = false;
+	this->doS3AclVerify = false;
+	this->runS3BucketAclPut = false;
+	this->runS3BucketAclGet = false;
+	this->useOpsLogLocking = false;
 }
 
 /**
@@ -585,19 +772,50 @@ void ProgArgs::initImplicitValues()
 		useGDSBufReg = true;
 	}
 
+	if(useBriefLiveStatsNewLine)
+		useBriefLiveStats = true;
+
 	if(!s3EndpointsStr.empty() && runAsService)
 	{
 		LOGGER(Log_NORMAL, "NOTE: S3 endpoints given. These will be used instead of any endpoints "
 			"provided by master." << std::endl);
+
 		s3EndpointsServiceOverrideStr = s3EndpointsStr;
 	}
 
 	benchLabelNoCommas = benchLabel;
 	std::replace(benchLabelNoCommas.begin(), benchLabelNoCommas.end(), ',', ' ');
+
+	if(useNetBench)
+	{
+		runCreateFilesPhase = true;
+
+		// default to no block variance unless explicitly requested by user
+		if(!argsVariablesMap.count(ARG_BLOCKVARIANCE_LONG) )
+			blockVariancePercent = 0;
+
+		// netbench uses dir mode. transfer size is 1x filesize per thread. this is for live stats.
+		numDirsOrigStr = "0";
+		numDirs = 0;
+		numFilesOrigStr = "1";
+		numFiles = 1;
+	}
+
+	if(integrityCheckSalt && blockVariancePercent)
+	{
+		if(runCreateFilesPhase)
+			LOGGER(Log_NORMAL, "NOTE: Integrity check disables block variance." << std::endl);
+
+		blockVariancePercent = 0;
+	}
+
+	useS3ObjectPrefixRand = (s3ObjectPrefix.find(RAND_PREFIX_MARKS_SUBSTR) != std::string::npos);
 }
 
 /**
- * Convert human strings with units (e.g. "4K") to actual numbers.
+ * Convert human strings/units to machine units. This includes conversion of unit suffixes
+ * (e.g. "4K") to actual numbers and human flags (e.g. madvise=rand,hugepage) to combined numeric
+ * flags values.
  */
 void ProgArgs::convertUnitStrings()
 {
@@ -610,6 +828,12 @@ void ProgArgs::convertUnitStrings()
 	treeRoundUpSize = UnitTk::numHumanToBytesBinary(treeRoundUpSizeOrigStr, false);
 	limitReadBps = UnitTk::numHumanToBytesBinary(limitReadBpsOrigStr, false);
 	limitWriteBps = UnitTk::numHumanToBytesBinary(limitWriteBpsOrigStr, false);
+	netBenchRespSize = UnitTk::numHumanToBytesBinary(netBenchRespSizeOrigStr, false);
+	sockRecvBufSize = UnitTk::numHumanToBytesBinary(sockRecvBufSizeOrigStr, false);
+	sockSendBufSize = UnitTk::numHumanToBytesBinary(sockSendBufSizeOrigStr, false);
+
+	fadviseFlags = TranslatorTk::fadviseArgsStrToFlags(fadviseFlagsOrigStr);
+	madviseFlags = TranslatorTk::madviseArgsStrToFlags(madviseFlagsOrigStr);
 }
 
 /**
@@ -622,6 +846,7 @@ void ProgArgs::checkArgs()
 	// parse/apply numa zone as early as possible to have all further allocations in right zone
 	parseNumaZones();
 	parseCPUCores();
+	parseNetDevs();
 
 	if(runAsService)
 	{
@@ -694,6 +919,47 @@ void ProgArgs::checkArgs()
 		useDirectIO = true;
 	}
 
+	if(useNetBench && hostsVec.empty() )
+		throw ProgException("Missing servers & clients definition for netbench mode.");
+
+	if(useNetBench && !numNetBenchServers)
+		throw ProgException("At least one server needs to be defined for netbench mode.");
+
+	if(useNetBench && (numNetBenchServers >= hostsVec.size() ) )
+		throw ProgException("At least one client needs to be defined for netbench mode.");
+
+	if(useNetBench && (!blockSize || !netBenchRespSize || !fileSize) )
+		throw ProgException(
+			"Blocksize, response size and file size must not be zero in netbench mode.");
+
+	if(useNetBench && (runCreateDirsPhase || runDeleteDirsPhase || runStatFilesPhase ||
+		runReadPhase || runDeleteFilesPhase) )
+		throw ProgException("Netbench mode only run in write phase.");
+
+	if(useRandomOffsets && useHDFS && runCreateFilesPhase)
+		throw ProgException("HDFS does not support random offsets for writes.");
+
+	if(!treeFilePath.empty() && useHDFS)
+		throw ProgException("HDFS mode does not support custom tree files.");
+
+	if(!gpuIDsStr.empty() && useHDFS)
+		throw ProgException("HDFS mode does not support GPUs.");
+
+	if(rwMixPercent && useHDFS)
+		throw ProgException("HDFS does not support rwmix.");
+
+	if( (ioDepth > 1) && useHDFS)
+		throw ProgException("HDFS does not support IO depth larger than 1.");
+
+	if(!noDirectIOCheck && useHDFS)
+		noDirectIOCheck = true; // direct IO flag not relevant for hdfs buffering
+
+	if( (ioDepth > 1) && useMmap)
+		throw ProgException("Memory mapped IO (mmap) does not support IO depth larger than 1.");
+
+	if(!gpuIDsStr.empty() && useMmap)
+		throw ProgException("Memory mapped IO (mmap) cannot be used with GPUs.");
+
 	if(useRandomOffsets && !s3EndpointsStr.empty() && runCreateFilesPhase)
 		LOGGER(Log_NORMAL, "NOTE: S3 write/upload cannot be used with random offsets. "
 			"Falling back to \"--" ARG_REVERSESEQOFFSETS_LONG "\"." << std::endl);
@@ -726,9 +992,9 @@ void ProgArgs::checkArgs()
 		throw ProgException("Option --" ARG_RWMIXPERCENT_LONG " cannot be used together with "
 			"option \"--" ARG_INTEGRITYCHECK_LONG "\"");
 
-	if(integrityCheckSalt && blockVariancePercent)
-		throw ProgException("Option \"--" ARG_BLOCKVARIANCE_LONG "\" cannot be used together with "
-			"option \"--" ARG_INTEGRITYCHECK_LONG "\"");
+	if(integrityCheckSalt && blockVariancePercent && runCreateFilesPhase)
+		throw ProgException("Option \"--" ARG_INTEGRITYCHECK_LONG "\" requires "
+			"\"--" ARG_BLOCKVARIANCE_LONG " 0\"");
 
 	if(integrityCheckSalt && runCreateFilesPhase && useRandomOffsets)
 		throw ProgException("Integrity check writes are not supported in combination with random "
@@ -740,6 +1006,9 @@ void ProgArgs::checkArgs()
 
 	if(doDirectVerify && (ioDepth > 1) )
 		throw ProgException("Direct verification cannot be used together with --" ARG_IODEPTH_LONG);
+
+	if(doReadInline && (ioDepth > 1) )
+		throw ProgException("Inline read cannot be used together with --" ARG_IODEPTH_LONG);
 
 	if(!hostsVec.empty() )
 		return;
@@ -780,6 +1049,11 @@ void ProgArgs::checkPathDependentArgs()
 
 	if(runS3ListObjNum && s3EndpointsVec.empty() )
 		throw ProgException("Object listing requires S3 endpoints definition.");
+
+	if( (runS3AclPut || runS3AclGet || runS3BucketAclPut || runS3BucketAclGet) &&
+		s3EndpointsVec.empty() )
+		throw ProgException("Putting/getting bucket or object ACLs requires S3 endpoints "
+			"definition.");
 
 	if( (hasUserSetRWMixPercent() || hasUserSetRWMixReadThreads() ) &&
 		!s3EndpointsStr.empty() &&
@@ -847,7 +1121,8 @@ void ProgArgs::checkPathDependentArgs()
 		if(!noDirectIOCheck && ( (blockSize % DIRECTIO_MINSIZE) != 0) )
 			throw ProgException("Block size for direct IO is not a multiple of required size. "
 				"(Note that a system's actual required size for direct IO might be even higher "
-				"depending on system page size and drive sector size.) "
+				"depending on system page size and drive sector size. "
+				"\"--" ARG_NODIRECTIOCHECK_LONG "\" disables this check.) "
 				"Required size: " + std::to_string(DIRECTIO_MINSIZE) );
 	}
 
@@ -968,24 +1243,28 @@ void ProgArgs::parseAndCheckPaths()
 				benchPathStr += std::string(BENCHPATH_DELIMITER)[0];
 			}
 		}
-		else // no override given, use benchPathStr from master
+		else
+		{ // no override given, use benchPathStr from master
+
+			// (note: no TranslatorTk::splitAndExpandStr() here; paths from master are taken as-is.)
 			boost::split(benchPathsVec, benchPathStr, boost::is_any_of(BENCHPATH_DELIMITER),
 				boost::token_compress_on);
-
-		// delete empty string elements from pathsVec (they come from delimiter use at start/end)
-		for( ; ; )
-		{
-			StringVec::iterator iter = std::find(benchPathsVec.begin(), benchPathsVec.end(), "");
-			if(iter == benchPathsVec.end() )
-				break;
-
-			benchPathsVec.erase(iter);
 		}
+
+		// delete empty string elements from vec (they come from delimiter use at beginning or end)
+		TranslatorTk::eraseEmptyStringsFromVec(benchPathsVec);
 	}
 	else
 	{ // master or local: take paths from command line as vector
 		if(argsVariablesMap.count(ARG_BENCHPATHS_LONG) )
 			benchPathsVec = argsVariablesMap[ARG_BENCHPATHS_LONG].as<StringVec>();
+
+		// expand lists/ranges in square brackets
+		if(!disablePathBracketsExpansion)
+			TranslatorTk::expandSquareBrackets(benchPathsVec);
+
+		// delete empty string elements from vec (they come from delimiter use at beginning or end)
+		TranslatorTk::eraseEmptyStringsFromVec(benchPathsVec);
 
 		convertS3PathsToCustomTree();
 
@@ -999,7 +1278,7 @@ void ProgArgs::parseAndCheckPaths()
 		}
 	}
 
-	if(benchPathsVec.empty() || benchPathStr.empty() )
+	if( (benchPathsVec.empty() || benchPathStr.empty() ) && !useNetBench)
 		throw ProgException("Benchmark path missing.");
 
 	// skip open of local paths if this is the master of a distributed run
@@ -1009,7 +1288,7 @@ void ProgArgs::parseAndCheckPaths()
 	// if we get here then this is not the master of a distributed run...
 
 	// skip open of local paths for S3
-	if(!s3EndpointsStr.empty() )
+	if(!s3EndpointsStr.empty() || useHDFS || useNetBench)
 	{
 		benchPathType = BenchPathType_DIR;
 		return;
@@ -1017,6 +1296,7 @@ void ProgArgs::parseAndCheckPaths()
 
 	prepareBenchPathFDsVec();
 	prepareCuFileHandleDataVec();
+	prepareMmapVec();
 }
 
 /**
@@ -1222,6 +1502,69 @@ void ProgArgs::prepareCuFileHandleDataVec()
 }
 
 /**
+ * Fill mmapVec based on benchPathFDsVec with open file descriptors from benchPathsVec.
+ * This is only effective in file/bdev mode for random IO (where we really need to have mapped all
+ * files/bdevs instead of only one file/bdev per thread at a time), because there is typically a
+ * 128TB max virtual address size limit per process (as seen in "lscpu | grep Address").
+ *
+ * Unmapping usually happens in ProgArgs destructor or resetBenchPath(), but this method also
+ * includes unmapping of any previous mappings.
+ *
+ * @throw ProgException on error.
+ */
+void ProgArgs::prepareMmapVec()
+{
+	// cleanup any old memory mappings
+
+	for(char*& mmapPtr : mmapVec)
+	{
+		if(mmapPtr == MAP_FAILED)
+			continue;
+
+		int unmapRes = munmap(mmapPtr, fileSize);
+
+		if(unmapRes == -1)
+			ERRLOGGER(Log_NORMAL, "File memory unmap failed. "
+				"SysErr: " << strerror(errno) << std::endl);
+
+		mmapPtr = (char*)MAP_FAILED;
+	}
+
+	mmapVec.resize(0);
+
+	if(!useMmap)
+		return; // nothing to do
+
+	if(benchPathType == BenchPathType_DIR)
+		return; // each worker will do own init
+
+	if(!useRandomOffsets)
+		return; // each worker will do own init
+
+	// prep mappings based on benchPathFDsVec
+
+	mmapVec.resize(benchPathFDsVec.size(), (char*)MAP_FAILED);
+
+	for(unsigned i=0; i < benchPathFDsVec.size(); i++)
+	{
+		int protectionMode = runCreateFilesPhase ? (PROT_WRITE | PROT_READ) : PROT_READ;
+		int fd = benchPathFDsVec[i];
+
+		if(fd == -1)
+		{
+			LOGGER(Log_DEBUG, "Cancelling mmap init loop because of fd \"-1\". "
+				"Problem path: " << "File: " + benchPathsVec[i] << std::endl);
+			break;
+		}
+
+		FileTk::fadvise<ProgException>(fd, fadviseFlags, benchPathsVec[i].c_str() );
+
+		mmapVec[i] = (char*)FileTk::mmapAndMadvise<ProgException>(fileSize, protectionMode,
+			MAP_SHARED, fd, madviseFlags, benchPathsVec[i].c_str() );
+	}
+}
+
+/**
  * In file mode and with random writes, truncate file to full size so that reads will work
  * afterwards across the full file size.
  *
@@ -1257,7 +1600,8 @@ void ProgArgs::prepareFileSize(int fd, std::string& path)
 			fileSize = currentFileSize;
 		}
 
-		if(!runCreateFilesPhase && ( (uint64_t)currentFileSize < fileSize) )
+		if(!runCreateFilesPhase && ( (uint64_t)currentFileSize < fileSize) &&
+			S_ISREG(statBuf.st_mode) ) // ignore character devices like "/dev/zero"
 			throw ProgException("Given size to use is larger than detected size. "
 				"File: " + path + "; "
 				"Detected size: " + std::to_string(currentFileSize) + "; "
@@ -1277,7 +1621,7 @@ void ProgArgs::prepareFileSize(int fd, std::string& path)
 			}
 
 			// truncate file to given size if set by user or when running in random mode
-			// (note: in random mode for reads to work across full length)
+			// (note: this is for reads in random mode to work across full length)
 			if(doTruncToSize ||
 				(useRandomOffsets && ( (size_t)currentFileSize < fileSize) ) )
 			{
@@ -1316,15 +1660,22 @@ void ProgArgs::prepareFileSize(int fd, std::string& path)
 		// warn when reading sparse (or compressed) files
 		if(runReadPhase && !runCreateFilesPhase)
 		{
+			off_t allocatedFileSize;
+
+			bool isFileSparseorCompressed =
+				FileTk::checkFileSparseOrCompressed(statBuf, allocatedFileSize);
+
+			double allocPercent = currentFileSize ?
+				100 * (double(allocatedFileSize) / double(currentFileSize) ) : 100;
+
 			// let user know about reading sparse/compressed files
-			// (note: statBuf.st_blocks is in 512-byte units)
-			if( (statBuf.st_blocks * 512) < currentFileSize)
+			if(isFileSparseorCompressed)
 				LOGGER(Log_NORMAL,
 					"NOTE: Allocated file disk space smaller than file size. File seems sparse or "
 					"compressed. (Sequential write can fill sparse areas.) "
 					"Path: " << path << "; "
-					"File size: " << currentFileSize << "; "
-					"Allocated size: " << (statBuf.st_blocks * 512) << std::endl);
+					"Allocated: " << std::setprecision(2) << std::fixed << allocPercent << "%" <<
+					std::endl);
 		}
 	}
 
@@ -1357,84 +1708,182 @@ void ProgArgs::prepareFileSize(int fd, std::string& path)
 }
 
 /**
- * Parse hosts string to fill hostsVec. Do nothing if hosts string is empty.
+ * Parse hosts string (and prepended servers string and appended clients string) to fill hostsVec.
+ * Do nothing if hosts strings and hosts file paths are empty.
  *
- * hostsVec elements will have default port appended if no port was defined.
+ * hostsVec is the result of this. elements will have default port appended if no port was defined.
  *
  * @throw ProgException if a problem is found, e.g. hosts string was not empty, but parsed result
  * 		is empty.
  */
 void ProgArgs::parseHosts()
 {
-	if(hostsStr.empty() && hostsFilePath.empty() )
-		return; // nothing to do
-
 	if(!numHosts)
 	{ // user explicitly selected zero hosts, so ignore any given hosts list or hosts file
-		hostsStr.clear();
-		hostsFilePath.clear();
+		serversStr = hostsStr = clientsStr = "";
+		serversFilePath = hostsFilePath = clientsFilePath = "";
 		return;
 	}
 
-	// read service hosts from file and add to hostsStr
-	if(!hostsFilePath.empty() )
+	struct ArgStrAndFilePathPair
 	{
-		std::ifstream hostsFile(hostsFilePath);
+		std::string* hostsStr;
+		std::string* hostsFilePath;
+	};
 
-		if(!hostsFile)
-			throw ProgException("Unable to read hosts file. Path: " + hostsFilePath);
 
-		hostsStr += " "; // add separator to existing hosts
+	std::vector<ArgStrAndFilePathPair> hostsStrAndPathsVec;
+	if(!useNetBench)
+		hostsStrAndPathsVec.push_back( { &hostsStr, &hostsFilePath } );
+	else
+	{
+		// note: the order is important: servers first and clients last (for netbench mode)
 
-		std::string lineStr;
+		hostsStrAndPathsVec.push_back( { &serversStr, &serversFilePath } );
+		hostsStrAndPathsVec.push_back( { &clientsStr, &clientsFilePath } );
+	}
 
-		while(std::getline(hostsFile, lineStr) )
+	// read service hosts from file and add to hostsStr, then add all together to hostsVec
+	for(ArgStrAndFilePathPair& currentPair : hostsStrAndPathsVec)
+	{
+		std::string& currentHostsStr = *currentPair.hostsStr;
+		std::string& currentHostsFilePath = *currentPair.hostsFilePath;
+
+		if(currentHostsStr.empty() && currentHostsFilePath.empty() )
+			continue; // nothing to do for this pair
+
+		if(!currentHostsFilePath.empty() )
 		{
-			if(lineStr.rfind("#", 0) == 0)
-				continue; // skip lines starting with "#" as comment char
+			std::ifstream hostsFile(currentHostsFilePath);
 
-			hostsStr += lineStr + ",";
+			if(!hostsFile)
+				throw ProgException("Unable to read hosts file. Path: " + currentHostsFilePath);
+
+			currentHostsStr += " "; // add separator to existing hosts
+
+			std::string lineStr;
+
+			while(std::getline(hostsFile, lineStr) )
+			{
+				if(lineStr.rfind("#", 0) == 0)
+					continue; // skip lines starting with "#" as comment char
+
+				currentHostsStr += lineStr + ",";
+			}
+
+			hostsFile.close();
 		}
 
-		hostsFile.close();
-	}
+		StringVec currentHostsVec;
 
-	boost::split(hostsVec, hostsStr, boost::is_any_of(HOSTLIST_DELIMITERS),
-			boost::token_compress_on);
+		// split by given delimiters and expand lists/ranges in square brackets
+		TranslatorTk::splitAndExpandStr(currentHostsStr, HOSTLIST_DELIMITERS, currentHostsVec);
 
-	// delete empty string elements from vec (they come from delimiter use at beginning or end)
-	for( ; ; )
-	{
-		StringVec::iterator iter = std::find(hostsVec.begin(), hostsVec.end(), "");
-		if(iter == hostsVec.end() )
-			break;
+		// delete empty string elements from vec (they come from delimiter use at beginning or end)
+		TranslatorTk::eraseEmptyStringsFromVec(currentHostsVec);
 
-		hostsVec.erase(iter);
-	}
+		for(std::string& host : currentHostsVec)
+		{
+			std::size_t findRes = host.find(HOST_PORT_SEPARATOR);
 
-	for(std::string& host : hostsVec)
-	{
-		std::size_t findRes = host.find(HOST_PORT_SEPARATOR);
+			// add default port to hosts where port is not provided by user
+			if(findRes == std::string::npos)
+				host += HOST_PORT_SEPARATOR + std::to_string(servicePort);
+		}
 
-		// add default port to hosts where port is not provided by user
-		if(findRes == std::string::npos)
-			host += HOST_PORT_SEPARATOR + std::to_string(servicePort);
-	}
+		if(currentHostsVec.empty() )
+			throw ProgException(
+				"Hosts defined, but parsing resulted in an empty list. "
+				"Given list: \"" + currentHostsStr + "\"");
 
-	if(hostsVec.empty() )
-		throw ProgException("Hosts defined, but parsing resulted in an empty list: " + hostsStr);
+		// init number of netbench servers
+		if(currentPair.hostsStr == &serversStr)
+			numNetBenchServers = currentHostsVec.size();
+
+		// append hostsVec of current round to general hostsVec
+		hostsVec.insert(hostsVec.end(), currentHostsVec.begin(), currentHostsVec.end() );
+
+	} // end of for-loop
 
 	// check for duplicates
 	std::set<std::string> hostsSet(hostsVec.begin(), hostsVec.end() );
 	if(hostsSet.size() != hostsVec.size() )
 		throw ProgException("List of hosts contains duplicates. "
 			"Number of duplicates: " + std::to_string(hostsVec.size() - hostsSet.size() ) + "; "
-			"List: " + hostsStr);
+			"List: " + TranslatorTk::stringVecToString(hostsVec, ",") );
 
 	// reduce to user-defined number of hosts
 	// ("numHosts==-1" means "use all hosts")
 	if( (numHosts != -1) && (hostsVec.size() > (unsigned)numHosts) )
 		hostsVec.resize(numHosts);
+
+	LOGGER(Log_DEBUG,
+		"Finished parsing hosts list. "
+		"numHosts: " << numHosts << "; "
+		"numNetBenchServers: " << numNetBenchServers << "; "
+		"hostsVec: " << TranslatorTk::stringVecToString(hostsVec, ",") << std::endl);
+}
+
+/**
+ * Parse netBenchServersVec from netBenchServersStr. This is only used in service instances.
+ * The master sends the full service hosts list, so we only keep the configured numNetBenchServers
+ * and calculate the ports as service port +NETBENCH_PORT_OFFSET for each service.
+ */
+void ProgArgs::parseNetBenchServersForService()
+{
+	if(!useNetBench || netBenchServersStr.empty() || !numNetBenchServers)
+		return; // nothing to do
+
+	LOGGER(Log_DEBUG, __func__ << ": " <<
+		"netBenchServersStr: " << netBenchServersStr << std::endl);
+
+	StringVec tmpServersVec; // intermediate vec before host/port split
+	std::string tmpNetBenchServersLogStr; // list of servers just for log message
+
+	// split by given delimiters and expand lists/ranges in square brackets
+	TranslatorTk::splitAndExpandStr(netBenchServersStr, HOSTLIST_DELIMITERS, tmpServersVec);
+
+	// delete empty string elements from vec (they come from delimiter use at beginning or end)
+	TranslatorTk::eraseEmptyStringsFromVec(tmpServersVec);
+
+	// fill actual netBenchServersVec from individual host names/IPs that might also come with port
+	for(std::string& server : tmpServersVec)
+	{
+		std::size_t findRes = server.find(HOST_PORT_SEPARATOR);
+
+		NetBenchServerAddr newServerAddr;
+
+		// add default port to hosts where port is not provided by user
+		// note: netbench port is service port + NETBENCH_PORT_OFFSET.
+		if(findRes == std::string::npos)
+		{ // no port given
+			newServerAddr.host = server;
+			newServerAddr.port = ARGDEFAULT_SERVICEPORT + NETBENCH_PORT_OFFSET;
+		}
+		else
+		{ // port given by user
+			newServerAddr.host = server.substr(0, findRes);
+
+			std::string portStr = server.substr(findRes+1);
+			newServerAddr.port = std::stoi(portStr) + NETBENCH_PORT_OFFSET;
+		}
+
+		netBenchServersVec.push_back(newServerAddr);
+	}
+
+	if(netBenchServersVec.empty() )
+		throw ProgException("Netbench servers defined, but parsing resulted in an empty list: " +
+			netBenchServersStr);
+
+	// reduce to user-defined number of servers
+	if(netBenchServersVec.size() > numNetBenchServers)
+		netBenchServersVec.resize(numNetBenchServers);
+
+	// just for log message
+	for(NetBenchServerAddr& addr : netBenchServersVec)
+		tmpNetBenchServersLogStr += addr.host + ":" + std::to_string(addr.port) + " ";
+
+	LOGGER(Log_VERBOSE, "netbench servers: " << tmpNetBenchServersLogStr << std::endl);
 }
 
 /**
@@ -1455,20 +1904,22 @@ void ProgArgs::parseNumaZones()
 	if(!NumaTk::isNumaInfoAvailable() )
 		throw ProgException("No NUMA zone info available.");
 
+	LOGGER(Log_DEBUG, __func__ << ": "
+		"numCores: " << std::thread::hardware_concurrency() << "; "
+		"cpu core affinity list: " << NumaTk::getCurrentCPUAffinityStrHuman() << std::endl);
+
+	if(numaZonesStr == NUMAZONES_ALL_ARG)
+		numaZonesStr = NumaTk::getAllNumaZonesStr();
+
+	LOGGER(Log_DEBUG, "raw numaZonesStr: " + numaZonesStr << std::endl);
+
 	StringVec zonesStrVec; // temporary for split()
 
-	boost::split(zonesStrVec, numaZonesStr, boost::is_any_of(ZONELIST_DELIMITERS),
-			boost::token_compress_on);
+	// split by given delimiters and expand lists/ranges in square brackets
+	TranslatorTk::splitAndExpandStr(numaZonesStr, ZONELIST_DELIMITERS, zonesStrVec);
 
 	// delete empty string elements from vec (they come from delimiter use at beginning or end)
-	for( ; ; )
-	{
-		StringVec::iterator iter = std::find(zonesStrVec.begin(), zonesStrVec.end(), "");
-		if(iter == zonesStrVec.end() )
-			break;
-
-		zonesStrVec.erase(iter);
-	}
+	TranslatorTk::eraseEmptyStringsFromVec(zonesStrVec);
 
 	if(zonesStrVec.empty() )
 		throw ProgException("NUMA zones defined, but parsing resulted in an empty list: " +
@@ -1479,12 +1930,19 @@ void ProgArgs::parseNumaZones()
 	for(unsigned i=0; i < zonesStrVec.size(); i++)
 		numaZonesStr += (i ? "," : "") + zonesStrVec[i];
 
-	// apply given zones to current thread
-	NumaTk::bindToNumaZones(numaZonesStr);
+	LOGGER(Log_DEBUG, __func__ << ": "
+		"zonesStrVec: " << TranslatorTk::stringVecToString(zonesStrVec, " ") << std::endl);
 
 	// convert from string vector to int vector
 	for(std::string& zoneStr : zonesStrVec)
 		numaZonesVec.push_back(std::stoi(zoneStr) );
+
+	// apply given zones to current thread
+	NumaTk::bindToNumaZones(numaZonesStr);
+
+	LOGGER(Log_DEBUG, __func__ << ": "
+		"numCores: " << std::thread::hardware_concurrency() << "; "
+		"cpu core affinity list after: " << NumaTk::getCurrentCPUAffinityStrHuman() << std::endl);
 }
 
 /**
@@ -1499,20 +1957,19 @@ void ProgArgs::parseCPUCores()
 	if(cpuCoresStr.empty() )
 		return; // nothing to do
 
+	if(cpuCoresStr == CPUCORES_ALL_ARG)
+		cpuCoresStr = NumaTk::getCurrentCPUAffinityStr();
+
+	LOGGER(Log_DEBUG, __func__ << ": "
+		"raw cpuCoresStr: " + cpuCoresStr << std::endl);
+
 	StringVec coresStrVec; // temporary for split()
 
-	boost::split(coresStrVec, cpuCoresStr, boost::is_any_of(ZONELIST_DELIMITERS),
-			boost::token_compress_on);
+	// split by given delimiters and expand lists/ranges in square brackets
+	TranslatorTk::splitAndExpandStr(cpuCoresStr, ZONELIST_DELIMITERS, coresStrVec);
 
 	// delete empty string elements from vec (they come from delimiter use at beginning or end)
-	for( ; ; )
-	{
-		StringVec::iterator iter = std::find(coresStrVec.begin(), coresStrVec.end(), "");
-		if(iter == coresStrVec.end() )
-			break;
-
-		coresStrVec.erase(iter);
-	}
+	TranslatorTk::eraseEmptyStringsFromVec(coresStrVec);
 
 	if(coresStrVec.empty() )
 		throw ProgException("CPU cores defined, but parsing resulted in an empty list: " +
@@ -1523,12 +1980,24 @@ void ProgArgs::parseCPUCores()
 	for(unsigned i=0; i < coresStrVec.size(); i++)
 		cpuCoresStr += (i ? "," : "") + coresStrVec[i];
 
-	// apply given cores to current thread
-	NumaTk::bindToCPUCores(cpuCoresVec);
-
 	// convert from string vector to int vector
 	for(std::string& coreStr : coresStrVec)
 		cpuCoresVec.push_back(std::stoi(coreStr) );
+
+	/* note: we don't sort the vectors here, because user might initionally have chosen the order
+		based on order of other args like gpu IDs. */
+
+	LOGGER(Log_DEBUG, __func__ << ": "
+		"numCores: " << std::thread::hardware_concurrency() << "; "
+		"cpu core affinity list before: " << TranslatorTk::intVectoHumanStr(cpuCoresVec) <<
+		std::endl);
+
+	// apply given cores to current thread
+	NumaTk::bindToCPUCores(cpuCoresVec);
+
+	LOGGER(Log_DEBUG, __func__ << ": "
+		"numCores: " << std::thread::hardware_concurrency() << "; "
+		"cpu core affinity list after: " << NumaTk::getCurrentCPUAffinityStrHuman() << std::endl);
 }
 
 /**
@@ -1547,22 +2016,33 @@ void ProgArgs::parseGPUIDs()
 
 	#ifndef CUDA_SUPPORT
 		throw ProgException("GPU IDs defined, but built without CUDA support.");
-	#endif
+	#else
+		if(gpuIDsStr == GPUIDS_ALL_ARG)
+		{
+			gpuIDsStr = "";
+			int numCudaDevs;
+
+			cudaError_t getDevsRes = cudaGetDeviceCount(&numCudaDevs);
+
+			if(getDevsRes != cudaSuccess)
+				throw ProgException(std::string("Getting CUDA device count failed. ") +
+					"CUDA Error: " + cudaGetErrorString(getDevsRes) );
+
+			for(int i=0; i < numCudaDevs; i++)
+				gpuIDsStr += ( (i > 0) ? "," + std::to_string(i) : std::to_string(i) );
+		}
+	#endif // CUDA_SUPPORT
+
+	LOGGER(Log_DEBUG, __func__ << ": "
+		"raw gpuIDsStr: " + gpuIDsStr << std::endl);
 
 	StringVec gpuIDsStrVec; // temporary for split()
 
-	boost::split(gpuIDsStrVec, gpuIDsStr, boost::is_any_of(GPULIST_DELIMITERS),
-		boost::token_compress_on);
+	// split by given delimiters and expand lists/ranges in square brackets
+	TranslatorTk::splitAndExpandStr(gpuIDsStr, GPULIST_DELIMITERS, gpuIDsStrVec);
 
 	// delete empty string elements from vec (they come from delimiter use at beginning or end)
-	for( ; ; )
-	{
-		StringVec::iterator iter = std::find(gpuIDsStrVec.begin(), gpuIDsStrVec.end(), "");
-		if(iter == gpuIDsStrVec.end() )
-			break;
-
-		gpuIDsStrVec.erase(iter);
-	}
+	TranslatorTk::eraseEmptyStringsFromVec(gpuIDsStrVec);
 
 	if(gpuIDsStrVec.empty() )
 		throw ProgException("GPU IDs defined, but parsing resulted in an empty list: " +
@@ -1587,7 +2067,10 @@ void ProgArgs::parseGPUIDs()
 
 			isCuFileDriverOpen = true;
 		}
-	#endif
+	#endif // CUFILE_SUPPORT
+
+	LOGGER(Log_DEBUG, __func__ << ": "
+		"gpu vec: " << TranslatorTk::intVectoHumanStr(gpuIDsVec) << std::endl);
 }
 
 /**
@@ -1609,23 +2092,39 @@ void ProgArgs::parseS3Endpoints()
 	if(!s3EndpointsServiceOverrideStr.empty() && runAsService)
 		s3EndpointsStr = s3EndpointsServiceOverrideStr; // user specified override for service
 
-	boost::split(s3EndpointsVec, s3EndpointsStr, boost::is_any_of(S3ENDPOINTS_DELIMITERS),
-		boost::token_compress_on);
+	// split by given delimiters and expand lists/ranges in square brackets
+	TranslatorTk::splitAndExpandStr(s3EndpointsStr, S3ENDPOINTS_DELIMITERS, s3EndpointsVec);
 
 	// delete empty string elements from vec (they come from delimiter use at beginning or end)
-	for( ; ; )
-	{
-		StringVec::iterator iter = std::find(s3EndpointsVec.begin(), s3EndpointsVec.end(), "");
-		if(iter == s3EndpointsVec.end() )
-			break;
-
-		s3EndpointsVec.erase(iter);
-	}
+	TranslatorTk::eraseEmptyStringsFromVec(s3EndpointsVec);
 
 	if(s3EndpointsVec.empty() )
 		throw ProgException("S3 endpoints defined, but parsing resulted in an empty list: " +
 			s3EndpointsStr);
 }
+
+/**
+ * Parse network interface devices list. Do nothing if given list is empty.
+ *
+ * @throw ProgException if a problem is found, e.g. given list was not empty, but parsed
+ * 		result is empty.
+ */
+void ProgArgs::parseNetDevs()
+{
+	if(netDevsStr.empty() )
+		return; // nothing to do
+
+	// split by given delimiters and expand lists/ranges in square brackets
+	TranslatorTk::splitAndExpandStr(netDevsStr, NETDEV_DELIMITERS, netDevsVec);
+
+	// delete empty string elements from vec (they come from delimiter use at beginning or end)
+	TranslatorTk::eraseEmptyStringsFromVec(netDevsVec);
+
+	if(netDevsVec.empty() )
+		throw ProgException("Network devices for binding defined, but parsing resulted in "
+			"an empty list: " + netDevsStr);
+}
+
 
 /**
  * Parse random number generator selection for random offsets and block variance..
@@ -1663,7 +2162,8 @@ void ProgArgs::loadCustomTreeFile()
 
 	// load file trees
 
-	if(runCreateFilesPhase || runStatFilesPhase || runReadPhase || runDeleteFilesPhase)
+	if(runCreateFilesPhase || runStatFilesPhase || runReadPhase || runDeleteFilesPhase ||
+		runS3AclPut || runS3AclGet || runS3BucketAclPut || runS3BucketAclGet)
 	{
 		// load tree of non-shared files (i.e. files that are equal to or smaller than blocksize)
 
@@ -1769,6 +2269,7 @@ BenchPathType ProgArgs::findBenchPathType(std::string pathStr)
 		case S_IFBLK: return BenchPathType_BLOCKDEV;
 		case S_IFDIR: return BenchPathType_DIR;
 		case S_IFREG: return BenchPathType_FILE;
+		case S_IFCHR: return BenchPathType_FILE; // for "/dev/null"
     }
 
     throw ProgException("Invalid path type: " + pathStr);
@@ -1860,7 +2361,7 @@ void ProgArgs::printHelpOverview()
 		"Large shared files or block devices (e.g. streaming or random IOPS):" ENDL
 		"  $ " EXE_NAME " --" ARG_HELPLARGE_LONG ENDL
 		std::endl <<
-		"Many files in different directories (e.g. lots of small files):" ENDL
+		"Multiple dirs and files per thread (e.g. lots of small files):" ENDL
 		"  $ " EXE_NAME " --" ARG_HELPMULTIFILE_LONG ENDL
 		std::endl <<
 #ifdef S3_SUPPORT
@@ -2012,7 +2513,8 @@ void ProgArgs::printHelpMultiFile()
 		(ARG_NUMTHREADS_LONG "," ARG_NUMTHREADS_SHORT, bpo::value(&this->numThreads),
 			"Number of I/O worker threads. (Default: 1)")
 		(ARG_NUMDIRS_LONG "," ARG_NUMDIRS_SHORT, bpo::value(&this->numDirs),
-			"Number of directories per I/O worker thread. (Default: 1)")
+			"Number of directories per I/O worker thread. This can be 0 to disable creation of any "
+			"subdirs, in which case all workers share the given dir. (Default: 1)")
 		(ARG_NUMFILES_LONG "," ARG_NUMFILES_SHORT, bpo::value(&this->numFilesOrigStr),
 			"Number of files per thread per directory. (Default: 1) Example: \""
 			"-" ARG_NUMTHREADS_SHORT "2 -" ARG_NUMDIRS_SHORT "3 -" ARG_NUMFILES_SHORT "4\" will "
@@ -2062,7 +2564,7 @@ void ProgArgs::printHelpMultiFile()
     std::cout <<
     	"Examples:" ENDL
 		"  Test 2 threads, each creating 3 directories with 4 1MiB files inside:" ENDL
-		"    $ " EXE_NAME " -w -d -t 2 -d -n 3 -N 4 -s 1m -b 1m /data/testdir" ENDL
+		"    $ " EXE_NAME " -w -d -t 2 -n 3 -N 4 -s 1m -b 1m /data/testdir" ENDL
 		std::endl <<
 		"  Same as above with long option names:" ENDL
 		"    $ " EXE_NAME " --write --mkdirs --threads 2 --dirs 3 --files 4 --size 1m \\" ENDL
@@ -2133,7 +2635,7 @@ void ProgArgs::printHelpS3()
 			"Number of I/O worker threads. (Default: 1)")
 		(ARG_NUMDIRS_LONG "," ARG_NUMDIRS_SHORT, bpo::value(&this->numDirs),
 			"Number of directories per I/O worker thread. Directories are slash-separated object "
-			"key prefixes. (Default: 1)")
+			"key prefixes. This can be 0 to disable creation of any subdirs. (Default: 1)")
 		(ARG_NUMFILES_LONG "," ARG_NUMFILES_SHORT, bpo::value(&this->numFilesOrigStr),
 			"Number of objects per thread per directory. (Default: 1) Example: \""
 			"-" ARG_NUMTHREADS_SHORT "2 -" ARG_NUMDIRS_SHORT "3 -" ARG_NUMFILES_SHORT "4\" will "
@@ -2258,6 +2760,8 @@ void ProgArgs::printHelpDistributed()
 		(ARG_NOSVCPATHSHARE_LONG, bpo::bool_switch(&this->noSharedServicePath),
 			"Benchmark paths are not shared between service hosts. Thus, each service host will"
 			"work on the full given dataset instead of its own fraction of the data set.")
+		(ARG_SHOWSVCELAPSED_LONG, bpo::bool_switch(&this->showServicesElapsed),
+			"Show elapsed time to completion of each service instance ordered by slowest thread.")
 		(ARG_INTERRUPT_LONG, bpo::bool_switch(&this->interruptServices),
 			"Interrupt current benchmark phase on given service mode hosts.")
 		(ARG_FOREGROUNDSERVICE_LONG, bpo::bool_switch(&this->runServiceInForeground),
@@ -2269,17 +2773,17 @@ void ProgArgs::printHelpDistributed()
 
     std::cout <<
     	"Examples:" ENDL
-		"  Run service on two different NUMA zones of host node001:" ENDL
-		"    $ " EXE_NAME " --service --zone 0 --port 1611" ENDL
-		"    $ " EXE_NAME " --service --zone 1 --port 1612" ENDL
+		"  Start services on hosts node001 and node002:" ENDL
+		"    $ ssh node001 " EXE_NAME " --service" ENDL
+		"    $ ssh node002 " EXE_NAME " --service" ENDL
 		std::endl <<
-		"  Run master to coordinate benchmarks on node001 services, using 4 threads per" ENDL
-		"  service and creating 8 dirs per thread, each containing 16 1MiB files:" ENDL
-		"    $ " EXE_NAME " --hosts node001:1611,node001:1612 \\" ENDL
+		"  Run distributed test on node001 and node002, using 4 threads per service" ENDL
+		"  instance and creating 8 dirs per thread, each containing 16 1MiB files:" ENDL
+		"    $ " EXE_NAME " --hosts node001,node002 \\" ENDL
 		"        -t 4 -d -n 8 -w -N 16 -s 1M /data/testdir" ENDL
 		std::endl <<
-		"  Quit services on host node001:" ENDL
-		"    $ " EXE_NAME " --hosts node001:1611,node001:1612 --quit" <<
+		"  Quit services on host node001 and node002:" ENDL
+		"    $ " EXE_NAME " --hosts node001,node002 --quit" <<
 		std::endl;
 }
 
@@ -2323,6 +2827,24 @@ void ProgArgs::printVersionAndBuildInfo()
 	std::cout << " * Net protocol version: " HTTP_PROTOCOLVERSION << std::endl;
 	std::cout << " * Build date: " __DATE__ << " " << __TIME__ << std::endl;
 
+#ifdef ALTHTTPSVC_SUPPORT
+	includedStream << "althttpsvc ";
+#else
+	notIncludedStream << "althttpsvc ";
+#endif
+
+#ifdef BACKTRACE_SUPPORT
+	includedStream << "backtrace ";
+#else
+	notIncludedStream << "backtrace ";
+#endif
+
+#ifdef COREBIND_SUPPORT
+	includedStream << "corebind ";
+#else
+	notIncludedStream << "corebind ";
+#endif
+
 #ifdef CUDA_SUPPORT
 	includedStream << "cuda ";
 #else
@@ -2335,22 +2857,10 @@ void ProgArgs::printVersionAndBuildInfo()
 	notIncludedStream << "cufile/gds ";
 #endif
 
-#ifdef BACKTRACE_SUPPORT
-	includedStream << "backtrace ";
+#ifdef HDFS_SUPPORT
+	includedStream << "hdfs ";
 #else
-	notIncludedStream << "backtrace ";
-#endif
-
-#ifdef S3_SUPPORT
-	includedStream << "s3 ";
-#else
-	notIncludedStream << "s3 ";
-#endif
-
-#ifdef USE_MIMALLOC
-	includedStream << "mimalloc ";
-#else
-	notIncludedStream << "mimalloc ";
+	notIncludedStream << "hdfs ";
 #endif
 
 #ifdef LIBAIO_SUPPORT
@@ -2359,22 +2869,34 @@ void ProgArgs::printVersionAndBuildInfo()
 	notIncludedStream << "libaio ";
 #endif
 
-#ifdef SYNCFS_SUPPORT
-	includedStream << "syncfs ";
-#else
-	notIncludedStream << "syncfs ";
-#endif
-
 #ifdef LIBNUMA_SUPPORT
 	includedStream << "libnuma ";
 #else
 	notIncludedStream << "libnuma ";
 #endif
 
-#ifdef COREBIND_SUPPORT
-	includedStream << "corebind ";
+#ifdef USE_MIMALLOC
+	includedStream << "mimalloc ";
 #else
-	notIncludedStream << "corebind ";
+	notIncludedStream << "mimalloc ";
+#endif
+
+#ifdef NCURSES_SUPPORT
+	includedStream << "ncurses ";
+#else
+	notIncludedStream << "ncurses ";
+#endif
+
+#ifdef S3_SUPPORT
+	includedStream << "s3 ";
+#else
+	notIncludedStream << "s3 ";
+#endif
+
+#ifdef SYNCFS_SUPPORT
+	includedStream << "syncfs ";
+#else
+	notIncludedStream << "syncfs ";
 #endif
 
 #ifdef SYSCALLH_SUPPORT
@@ -2387,6 +2909,10 @@ void ProgArgs::printVersionAndBuildInfo()
 		(includedStream.str().empty() ? "-" : includedStream.str() ) << std::endl;
 	std::cout << " * Excluded optional build features: " <<
 		(notIncludedStream.str().empty() ? "-" : notIncludedStream.str() ) << std::endl;
+
+	std::cout << " * System steady clock precision: " <<
+		( (double)std::chrono::steady_clock::period::num / std::chrono::steady_clock::period::den)
+		<< " sec" << std::endl;
 }
 
 /**
@@ -2396,65 +2922,90 @@ void ProgArgs::printVersionAndBuildInfo()
  */
 void ProgArgs::setFromPropertyTreeForService(bpt::ptree& tree)
 {
-	benchPathStr = tree.get<std::string>(ARG_BENCHPATHS_LONG);
-	numThreads = tree.get<size_t>(ARG_NUMTHREADS_LONG);
-	numDirs = tree.get<size_t>(ARG_NUMDIRS_LONG);
-	numFiles = tree.get<size_t>(ARG_NUMFILES_LONG);
-	fileSize = tree.get<uint64_t>(ARG_FILESIZE_LONG);
-	blockSize = tree.get<size_t>(ARG_BLOCK_LONG);
-	useDirectIO = tree.get<bool>(ARG_DIRECTIO_LONG);
-	ignoreDelErrors = tree.get<bool>(ARG_IGNOREDELERR_LONG);
-	ignore0USecErrors = tree.get<bool>(ARG_IGNORE0USECERR_LONG);
-	runCreateDirsPhase = tree.get<bool>(ARG_CREATEDIRS_LONG);
-	runCreateFilesPhase = tree.get<bool>(ARG_CREATEFILES_LONG);
-	runReadPhase = tree.get<bool>(ARG_READ_LONG);
-	runDeleteFilesPhase = tree.get<bool>(ARG_DELETEFILES_LONG);
-	runDeleteDirsPhase = tree.get<bool>(ARG_DELETEDIRS_LONG);
-	useRandomOffsets = tree.get<bool>(ARG_RANDOMOFFSETS_LONG);
-	useRandomAligned = tree.get<bool>(ARG_RANDOMALIGN_LONG);
-	randomAmount = tree.get<uint64_t>(ARG_RANDOMAMOUNT_LONG);
-	ioDepth = tree.get<size_t>(ARG_IODEPTH_LONG);
-	doTruncate = tree.get<bool>(ARG_TRUNCATE_LONG);
-	gpuIDsStr = tree.get<std::string>(ARG_GPUIDS_LONG);
-	useCuFile = tree.get<bool>(ARG_CUFILE_LONG);
-	useGDSBufReg = tree.get<bool>(ARG_GDSBUFREG_LONG);
-	useCuFileDriverOpen = tree.get<bool>(ARG_CUFILEDRIVEROPEN_LONG);
-	useCuHostBufReg = tree.get<bool>(ARG_CUHOSTBUFREG_LONG);
-	integrityCheckSalt = tree.get<uint64_t>(ARG_INTEGRITYCHECK_LONG);
-	runSyncPhase = tree.get<bool>(ARG_SYNCPHASE_LONG);
-	runDropCachesPhase = tree.get<bool>(ARG_DROPCACHESPHASE_LONG);
-	runStatFilesPhase = tree.get<bool>(ARG_STATFILES_LONG);
-	doTruncToSize = tree.get<bool>(ARG_TRUNCTOSIZE_LONG);
-	doPreallocFile = tree.get<bool>(ARG_PREALLOCFILE_LONG);
-	doDirSharing = tree.get<bool>(ARG_DIRSHARING_LONG);
-	doDirectVerify = tree.get<bool>(ARG_VERIFYDIRECT_LONG);
-	blockVariancePercent = tree.get<unsigned>(ARG_BLOCKVARIANCE_LONG);
-	rwMixPercent = tree.get<unsigned>(ARG_RWMIXPERCENT_LONG);
-	blockVarianceAlgo = tree.get<std::string>(ARG_BLOCKVARIANCEALGO_LONG);
-	randOffsetAlgo = tree.get<std::string>(ARG_RANDSEEKALGO_LONG);
-	fileShareSize = tree.get<uint64_t>(ARG_FILESHARESIZE_LONG);
-	useCustomTreeRandomize = tree.get<bool>(ARG_TREERANDOMIZE_LONG);
-	treeRoundUpSize = tree.get<uint64_t>(ARG_TREEROUNDUP_LONG);
-	s3EndpointsStr = tree.get<std::string>(ARG_S3ENDPOINTS_LONG);
-	s3AccessKey = tree.get<std::string>(ARG_S3ACCESSKEY_LONG);
-	s3AccessSecret = tree.get<std::string>(ARG_S3ACCESSSECRET_LONG);
-	s3Region = tree.get<std::string>(ARG_S3REGION_LONG);
-	useS3FastRead = tree.get<bool>(ARG_S3FASTGET_LONG);
-	useS3TransferManager = tree.get<bool>(ARG_S3TRANSMAN_LONG);
-	noDirectIOCheck = tree.get<bool>(ARG_NODIRECTIOCHECK_LONG);
-	s3ObjectPrefix = tree.get<std::string>(ARG_S3OBJECTPREFIX_LONG);
-	runS3ListObjNum = tree.get<uint64_t>(ARG_S3LISTOBJ_LONG);
-	runS3ListObjParallel = tree.get<bool>(ARG_S3LISTOBJPARALLEL_LONG);
-	doS3ListObjVerify = tree.get<bool>(ARG_S3LISTOBJVERIFY_LONG);
-	doReverseSeqOffsets = tree.get<bool>(ARG_REVERSESEQOFFSETS_LONG);
-	doInfiniteIOLoop = tree.get<bool>(ARG_INFINITEIOLOOP_LONG);
-	numRWMixReadThreads = tree.get<size_t>(ARG_RWMIXTHREADS_LONG);
-	s3SignPolicy = tree.get<unsigned short>(ARG_S3SIGNPAYLOAD_LONG);
-	useS3RandObjSelect = tree.get<bool>(ARG_S3RANDOBJ_LONG);
+	// note: alphabetical order by variable name ("benchLabel", "benchPathStr" etc)
+
 	benchLabel = tree.get<std::string>(ARG_BENCHLABEL_LONG);
-	useNoFDSharing = tree.get<bool>(ARG_NOFDSHARING_LONG);
+	benchPathStr = tree.get<std::string>(ARG_BENCHPATHS_LONG);
+	blockSize = tree.get<size_t>(ARG_BLOCK_LONG);
+	blockVarianceAlgo = tree.get<std::string>(ARG_BLOCKVARIANCEALGO_LONG);
+	blockVariancePercent = tree.get<unsigned>(ARG_BLOCKVARIANCE_LONG);
+	doDirectVerify = tree.get<bool>(ARG_VERIFYDIRECT_LONG);
+	doDirSharing = tree.get<bool>(ARG_DIRSHARING_LONG);
+	doInfiniteIOLoop = tree.get<bool>(ARG_INFINITEIOLOOP_LONG);
+	doPreallocFile = tree.get<bool>(ARG_PREALLOCFILE_LONG);
+	doReadInline = tree.get<bool>(ARG_READINLINE_LONG);
+	doReverseSeqOffsets = tree.get<bool>(ARG_REVERSESEQOFFSETS_LONG);
+	doS3AclVerify = tree.get<bool>(ARG_S3ACLVERIFY_LONG);
+	doS3ListObjVerify = tree.get<bool>(ARG_S3LISTOBJVERIFY_LONG);
+	doStatInline = tree.get<bool>(ARG_STATFILESINLINE_LONG);
+	doTruncate = tree.get<bool>(ARG_TRUNCATE_LONG);
+	doTruncToSize = tree.get<bool>(ARG_TRUNCTOSIZE_LONG);
+	fadviseFlags = tree.get<unsigned>(ARG_FADVISE_LONG);
+	fileShareSize = tree.get<uint64_t>(ARG_FILESHARESIZE_LONG);
+	fileSize = tree.get<uint64_t>(ARG_FILESIZE_LONG);
+	gpuIDsStr = tree.get<std::string>(ARG_GPUIDS_LONG);
+	ignore0USecErrors = tree.get<bool>(ARG_IGNORE0USECERR_LONG);
+	ignoreDelErrors = tree.get<bool>(ARG_IGNOREDELERR_LONG);
+	integrityCheckSalt = tree.get<uint64_t>(ARG_INTEGRITYCHECK_LONG);
+	ioDepth = tree.get<size_t>(ARG_IODEPTH_LONG);
 	limitReadBps = tree.get<uint64_t>(ARG_LIMITREAD_LONG);
 	limitWriteBps = tree.get<uint64_t>(ARG_LIMITWRITE_LONG);
+	madviseFlags = tree.get<unsigned>(ARG_MADVISE_LONG);
+	netBenchRespSize = tree.get<size_t>(ARG_RESPSIZE_LONG);
+	netBenchServersStr = tree.get<std::string>(ARG_NETBENCHSERVERSSTR_LONG);
+	noDirectIOCheck = tree.get<bool>(ARG_NODIRECTIOCHECK_LONG);
+	numDirs = tree.get<size_t>(ARG_NUMDIRS_LONG);
+	numFiles = tree.get<size_t>(ARG_NUMFILES_LONG);
+	numNetBenchServers = tree.get<unsigned>(ARG_NUMNETBENCHSERVERS_LONG);
+	numRWMixReadThreads = tree.get<size_t>(ARG_RWMIXTHREADS_LONG);
+	numThreads = tree.get<size_t>(ARG_NUMTHREADS_LONG);
+	opsLogPath = tree.get<std::string>(ARG_OPSLOGPATH_LONG);
+	randOffsetAlgo = tree.get<std::string>(ARG_RANDSEEKALGO_LONG);
+	randomAmount = tree.get<uint64_t>(ARG_RANDOMAMOUNT_LONG);
+	runCreateDirsPhase = tree.get<bool>(ARG_CREATEDIRS_LONG);
+	runCreateFilesPhase = tree.get<bool>(ARG_CREATEFILES_LONG);
+	runDeleteDirsPhase = tree.get<bool>(ARG_DELETEDIRS_LONG);
+	runDeleteFilesPhase = tree.get<bool>(ARG_DELETEFILES_LONG);
+	runDropCachesPhase = tree.get<bool>(ARG_DROPCACHESPHASE_LONG);
+	runReadPhase = tree.get<bool>(ARG_READ_LONG);
+	runS3AclGet = tree.get<bool>(ARG_S3ACLGET_LONG);
+	runS3AclPut = tree.get<bool>(ARG_S3ACLPUT_LONG);
+	runS3BucketAclGet = tree.get<bool>(ARG_S3BUCKETACLGET_LONG);
+	runS3BucketAclPut = tree.get<bool>(ARG_S3BUCKETACLPUT_LONG);
+	runS3ListObjNum = tree.get<uint64_t>(ARG_S3LISTOBJ_LONG);
+	runS3ListObjParallel = tree.get<bool>(ARG_S3LISTOBJPARALLEL_LONG);
+	runS3MultiDelObjNum = tree.get<uint64_t>(ARG_S3MULTIDELETE_LONG);
+	runStatFilesPhase = tree.get<bool>(ARG_STATFILES_LONG);
+	runSyncPhase = tree.get<bool>(ARG_SYNCPHASE_LONG);
+	rwMixPercent = tree.get<unsigned>(ARG_RWMIXPERCENT_LONG);
+	s3AccessKey = tree.get<std::string>(ARG_S3ACCESSKEY_LONG);
+	s3AccessSecret = tree.get<std::string>(ARG_S3ACCESSSECRET_LONG);
+	s3AclGrantee = tree.get<std::string>(ARG_S3ACLGRANTEE_LONG);
+	s3AclGranteePermissions = tree.get<std::string>(ARG_S3ACLGRANTS_LONG);
+	s3AclGranteeType = tree.get<std::string>(ARG_S3ACLGRANTEETYPE_LONG);
+	s3EndpointsStr = tree.get<std::string>(ARG_S3ENDPOINTS_LONG);
+	s3ObjectPrefix = tree.get<std::string>(ARG_S3OBJECTPREFIX_LONG);
+	s3Region = tree.get<std::string>(ARG_S3REGION_LONG);
+	s3SignPolicy = tree.get<unsigned short>(ARG_S3SIGNPAYLOAD_LONG);
+	sockRecvBufSize = tree.get<int>(ARG_RECVBUFSIZE_LONG);
+	sockSendBufSize = tree.get<int>(ARG_SENDBUFSIZE_LONG);
+	treeRoundUpSize = tree.get<uint64_t>(ARG_TREEROUNDUP_LONG);
+	useCuFile = tree.get<bool>(ARG_CUFILE_LONG);
+	useCuFileDriverOpen = tree.get<bool>(ARG_CUFILEDRIVEROPEN_LONG);
+	useCuHostBufReg = tree.get<bool>(ARG_CUHOSTBUFREG_LONG);
+	useCustomTreeRandomize = tree.get<bool>(ARG_TREERANDOMIZE_LONG);
+	useDirectIO = tree.get<bool>(ARG_DIRECTIO_LONG);
+	useGDSBufReg = tree.get<bool>(ARG_GDSBUFREG_LONG);
+	useHDFS = tree.get<bool>(ARG_HDFS_LONG);
+	useMmap = tree.get<bool>(ARG_MMAP_LONG);
+	useNetBench = tree.get<bool>(ARG_NETBENCH_LONG);
+	useNoFDSharing = tree.get<bool>(ARG_NOFDSHARING_LONG);
+	useOpsLogLocking = tree.get<bool>(ARG_OPSLOGLOCKING_LONG);
+	useRandomAligned = tree.get<bool>(ARG_RANDOMALIGN_LONG);
+	useRandomOffsets = tree.get<bool>(ARG_RANDOMOFFSETS_LONG);
+	useS3FastRead = tree.get<bool>(ARG_S3FASTGET_LONG);
+	useS3RandObjSelect = tree.get<bool>(ARG_S3RANDOBJ_LONG);
+	useS3TransferManager = tree.get<bool>(ARG_S3TRANSMAN_LONG);
 
 	// dynamically calculated values for service hosts...
 
@@ -2481,6 +3032,7 @@ void ProgArgs::setFromPropertyTreeForService(bpt::ptree& tree)
 	}
 
 	parseS3Endpoints();
+	parseNetBenchServersForService();
 
 	// rebuild benchPathsVec/benchPathFDsVec and check if bench dirs are accessible
 	parseAndCheckPaths();
@@ -2492,6 +3044,9 @@ void ProgArgs::setFromPropertyTreeForService(bpt::ptree& tree)
 		gpuIDsStr = gpuIDsServiceOverride;
 
 	parseGPUIDs();
+
+	// init implict vals
+	useS3ObjectPrefixRand = (s3ObjectPrefix.find(RAND_PREFIX_MARKS_SUBSTR) != std::string::npos);
 }
 
 /**
@@ -2501,65 +3056,90 @@ void ProgArgs::setFromPropertyTreeForService(bpt::ptree& tree)
  */
 void ProgArgs::getAsPropertyTreeForService(bpt::ptree& outTree, size_t serviceRank) const
 {
-	outTree.put(ARG_BENCHPATHS_LONG, benchPathStr);
-	outTree.put(ARG_NUMTHREADS_LONG, numThreads);
-	outTree.put(ARG_NUMDIRS_LONG, numDirs);
-	outTree.put(ARG_NUMFILES_LONG, numFiles);
-	outTree.put(ARG_FILESIZE_LONG, fileSize);
+	// note: alphabetical order by ARG_... name
+
 	outTree.put(ARG_BLOCK_LONG, blockSize);
-	outTree.put(ARG_DIRECTIO_LONG, useDirectIO);
-	outTree.put(ARG_IGNOREDELERR_LONG, ignoreDelErrors);
-	outTree.put(ARG_IGNORE0USECERR_LONG, ignore0USecErrors);
+	outTree.put(ARG_BLOCKVARIANCE_LONG, blockVariancePercent);
+	outTree.put(ARG_BLOCKVARIANCEALGO_LONG, blockVarianceAlgo);
+	outTree.put(ARG_BENCHLABEL_LONG, benchLabel);
+	outTree.put(ARG_BENCHPATHS_LONG, benchPathStr);
 	outTree.put(ARG_CREATEDIRS_LONG, runCreateDirsPhase);
 	outTree.put(ARG_CREATEFILES_LONG, runCreateFilesPhase);
-	outTree.put(ARG_READ_LONG, runReadPhase);
-	outTree.put(ARG_DELETEFILES_LONG, runDeleteFilesPhase);
-	outTree.put(ARG_DELETEDIRS_LONG, runDeleteDirsPhase);
-	outTree.put(ARG_RANDOMOFFSETS_LONG, useRandomOffsets);
-	outTree.put(ARG_RANDOMALIGN_LONG, useRandomAligned);
-	outTree.put(ARG_RANDOMAMOUNT_LONG, randomAmount);
-	outTree.put(ARG_NUMDATASETTHREADS_LONG, numDataSetThreads);
-	outTree.put(ARG_IODEPTH_LONG, ioDepth);
-	outTree.put(ARG_TRUNCATE_LONG, doTruncate);
 	outTree.put(ARG_CUFILE_LONG, useCuFile);
-	outTree.put(ARG_GDSBUFREG_LONG, useGDSBufReg);
 	outTree.put(ARG_CUFILEDRIVEROPEN_LONG, useCuFileDriverOpen);
 	outTree.put(ARG_CUHOSTBUFREG_LONG, useCuHostBufReg);
-	outTree.put(ARG_INTEGRITYCHECK_LONG, integrityCheckSalt);
-	outTree.put(ARG_SYNCPHASE_LONG, runSyncPhase);
-	outTree.put(ARG_DROPCACHESPHASE_LONG, runDropCachesPhase);
-	outTree.put(ARG_STATFILES_LONG, runStatFilesPhase);
-	outTree.put(ARG_TRUNCTOSIZE_LONG, doTruncToSize);
-	outTree.put(ARG_PREALLOCFILE_LONG, doPreallocFile);
+	outTree.put(ARG_DELETEDIRS_LONG, runDeleteDirsPhase);
+	outTree.put(ARG_DELETEFILES_LONG, runDeleteFilesPhase);
 	outTree.put(ARG_DIRSHARING_LONG, doDirSharing);
-	outTree.put(ARG_VERIFYDIRECT_LONG, doDirectVerify);
-	outTree.put(ARG_BLOCKVARIANCE_LONG, blockVariancePercent);
-	outTree.put(ARG_RWMIXPERCENT_LONG, rwMixPercent);
-	outTree.put(ARG_BLOCKVARIANCEALGO_LONG, blockVarianceAlgo);
-	outTree.put(ARG_RANDSEEKALGO_LONG, randOffsetAlgo);
+	outTree.put(ARG_DIRECTIO_LONG, useDirectIO);
+	outTree.put(ARG_DROPCACHESPHASE_LONG, runDropCachesPhase);
+	outTree.put(ARG_FADVISE_LONG, fadviseFlags);
 	outTree.put(ARG_FILESHARESIZE_LONG, fileShareSize);
-	outTree.put(ARG_TREERANDOMIZE_LONG, useCustomTreeRandomize);
-	outTree.put(ARG_TREEROUNDUP_LONG, treeRoundUpSize);
-	outTree.put(ARG_S3ENDPOINTS_LONG, s3EndpointsStr);
+	outTree.put(ARG_FILESIZE_LONG, fileSize);
+	outTree.put(ARG_GDSBUFREG_LONG, useGDSBufReg);
+	outTree.put(ARG_HDFS_LONG, useHDFS);
+	outTree.put(ARG_IGNORE0USECERR_LONG, ignore0USecErrors);
+	outTree.put(ARG_IGNOREDELERR_LONG, ignoreDelErrors);
+	outTree.put(ARG_INFINITEIOLOOP_LONG, doInfiniteIOLoop);
+	outTree.put(ARG_INTEGRITYCHECK_LONG, integrityCheckSalt);
+	outTree.put(ARG_IODEPTH_LONG, ioDepth);
+	outTree.put(ARG_LIMITREAD_LONG, limitReadBps);
+	outTree.put(ARG_LIMITWRITE_LONG, limitWriteBps);
+	outTree.put(ARG_MADVISE_LONG, madviseFlags);
+	outTree.put(ARG_MMAP_LONG, useMmap);
+	outTree.put(ARG_NETBENCH_LONG, useNetBench);
+	outTree.put(ARG_NETBENCHSERVERSSTR_LONG, serversStr);
+	outTree.put(ARG_NUMDATASETTHREADS_LONG, numDataSetThreads);
+	outTree.put(ARG_NUMDIRS_LONG, numDirs);
+	outTree.put(ARG_NUMFILES_LONG, numFiles);
+	outTree.put(ARG_NUMNETBENCHSERVERS_LONG, numNetBenchServers);
+	outTree.put(ARG_NUMTHREADS_LONG, numThreads);
+	outTree.put(ARG_NOFDSHARING_LONG, useNoFDSharing);
+	outTree.put(ARG_NODIRECTIOCHECK_LONG, noDirectIOCheck);
+	outTree.put(ARG_OPSLOGLOCKING_LONG, useOpsLogLocking);
+	outTree.put(ARG_OPSLOGPATH_LONG, opsLogPath);
+	outTree.put(ARG_PREALLOCFILE_LONG, doPreallocFile);
+	outTree.put(ARG_RANDOMALIGN_LONG, useRandomAligned);
+	outTree.put(ARG_RANDOMAMOUNT_LONG, randomAmount);
+	outTree.put(ARG_RANDOMOFFSETS_LONG, useRandomOffsets);
+	outTree.put(ARG_RANDSEEKALGO_LONG, randOffsetAlgo);
+	outTree.put(ARG_READ_LONG, runReadPhase);
+	outTree.put(ARG_READINLINE_LONG, doReadInline);
+	outTree.put(ARG_RECVBUFSIZE_LONG, sockRecvBufSize);
+	outTree.put(ARG_RESPSIZE_LONG, netBenchRespSize);
+	outTree.put(ARG_REVERSESEQOFFSETS_LONG, doReverseSeqOffsets);
+	outTree.put(ARG_RWMIXPERCENT_LONG, rwMixPercent);
+	outTree.put(ARG_RWMIXTHREADS_LONG, numRWMixReadThreads);
 	outTree.put(ARG_S3ACCESSKEY_LONG, s3AccessKey);
 	outTree.put(ARG_S3ACCESSSECRET_LONG, s3AccessSecret);
-	outTree.put(ARG_S3REGION_LONG, s3Region);
+	outTree.put(ARG_S3ACLGET_LONG, runS3AclGet);
+	outTree.put(ARG_S3ACLGRANTEE_LONG, s3AclGrantee);
+	outTree.put(ARG_S3ACLGRANTEETYPE_LONG, s3AclGranteeType);
+	outTree.put(ARG_S3ACLGRANTS_LONG, s3AclGranteePermissions);
+	outTree.put(ARG_S3ACLPUT_LONG, runS3AclPut);
+	outTree.put(ARG_S3ACLVERIFY_LONG, doS3AclVerify);
+	outTree.put(ARG_S3BUCKETACLGET_LONG, runS3BucketAclGet);
+	outTree.put(ARG_S3BUCKETACLPUT_LONG, runS3BucketAclPut);
+	outTree.put(ARG_S3ENDPOINTS_LONG, s3EndpointsStr);
 	outTree.put(ARG_S3FASTGET_LONG, useS3FastRead);
-	outTree.put(ARG_S3TRANSMAN_LONG, useS3TransferManager);
-	outTree.put(ARG_NODIRECTIOCHECK_LONG, noDirectIOCheck);
-	outTree.put(ARG_S3OBJECTPREFIX_LONG, s3ObjectPrefix);
 	outTree.put(ARG_S3LISTOBJ_LONG, runS3ListObjNum);
 	outTree.put(ARG_S3LISTOBJPARALLEL_LONG, runS3ListObjParallel);
 	outTree.put(ARG_S3LISTOBJVERIFY_LONG, doS3ListObjVerify);
-	outTree.put(ARG_REVERSESEQOFFSETS_LONG, doReverseSeqOffsets);
-	outTree.put(ARG_INFINITEIOLOOP_LONG, doInfiniteIOLoop);
-	outTree.put(ARG_RWMIXTHREADS_LONG, numRWMixReadThreads);
-	outTree.put(ARG_S3SIGNPAYLOAD_LONG, s3SignPolicy);
+	outTree.put(ARG_S3MULTIDELETE_LONG, runS3MultiDelObjNum);
+	outTree.put(ARG_S3OBJECTPREFIX_LONG, s3ObjectPrefix);
 	outTree.put(ARG_S3RANDOBJ_LONG, useS3RandObjSelect);
-	outTree.put(ARG_BENCHLABEL_LONG, benchLabel);
-	outTree.put(ARG_NOFDSHARING_LONG, useNoFDSharing);
-	outTree.put(ARG_LIMITREAD_LONG, limitReadBps);
-	outTree.put(ARG_LIMITWRITE_LONG, limitWriteBps);
+	outTree.put(ARG_S3REGION_LONG, s3Region);
+	outTree.put(ARG_S3SIGNPAYLOAD_LONG, s3SignPolicy);
+	outTree.put(ARG_S3TRANSMAN_LONG, useS3TransferManager);
+	outTree.put(ARG_SENDBUFSIZE_LONG, sockSendBufSize);
+	outTree.put(ARG_STATFILES_LONG, runStatFilesPhase);
+	outTree.put(ARG_STATFILESINLINE_LONG, doStatInline);
+	outTree.put(ARG_SYNCPHASE_LONG, runSyncPhase);
+	outTree.put(ARG_TRUNCATE_LONG, doTruncate);
+	outTree.put(ARG_TRUNCTOSIZE_LONG, doTruncToSize);
+	outTree.put(ARG_TREERANDOMIZE_LONG, useCustomTreeRandomize);
+	outTree.put(ARG_TREEROUNDUP_LONG, treeRoundUpSize);
+	outTree.put(ARG_VERIFYDIRECT_LONG, doDirectVerify);
 
 
 	// dynamically calculated values for service hosts...
@@ -2640,6 +3220,24 @@ void ProgArgs::getAsStringVec(StringVec& outLabelsVec, StringVec& outValuesVec) 
  */
 void ProgArgs::resetBenchPath()
 {
+	// cleanup any old memory mappings
+
+	for(char*& mmapPtr : mmapVec)
+	{
+		if(mmapPtr == MAP_FAILED)
+			continue;
+
+		int unmapRes = munmap(mmapPtr, fileSize);
+
+		if(unmapRes == -1)
+			ERRLOGGER(Log_NORMAL, "File memory unmap failed. "
+				"SysErr: " << strerror(errno) << std::endl);
+
+		mmapPtr = (char*)MAP_FAILED;
+	}
+
+	mmapVec.resize(0);
+
 	// dereg prev registered handles. (CuFileHandleData can handle the case of entries not reg'ed.)
 	for(CuFileHandleData& cuFileHandleData : cuFileHandleDataVec)
 			cuFileHandleData.deregisterHandle();
@@ -2663,6 +3261,7 @@ void ProgArgs::resetBenchPath()
 	customTree.filesShared.clear();
 
 	s3EndpointsVec.clear();
+	netBenchServersVec.clear();
 
 #ifdef CUFILE_SUPPORT
 	if(isCuFileDriverOpen)
@@ -2813,8 +3412,27 @@ void ProgArgs::checkCSVFileCompatibility()
 	int numCommas = std::count(lineStr.begin(), lineStr.end(), ',');
 
 	if(numCommas != CSVFILE_EXPECTED_COMMAS)
-		throw ProgException("CSV file compatibility check failed. "
-			"Was this file written with a different version? "
+		throw ProgException("CSV output file exists. Trying to append, but column compatibility "
+			"check failed. "
+			"Was this file generated by a different " EXE_NAME " version? "
 			"Found commas: " + std::to_string(numCommas) + "; "
-			"Expected commas: " + std::to_string(CSVFILE_EXPECTED_COMMAS) );
+			"Expected commas: " + std::to_string(CSVFILE_EXPECTED_COMMAS) + "; "
+			"File: " + csvFilePath);
+}
+
+/**
+ * Rotate hosts vector by user-defined number.
+ *
+ * This is a no-op if user did not specify rotation or if netbench mode is used.
+ *
+ * This is not thread-safe because it's intended to be called between test phases and with a
+ * correponsing restart of workers.
+ */
+void ProgArgs::rotateHosts()
+{
+	if( (hostsVec.size() < 2) || useNetBench)
+		return;
+
+	for(unsigned i = 0; i < rotateHostsNum; i++)
+		std::rotate(hostsVec.begin(), hostsVec.begin() + 1, hostsVec.end() );
 }
