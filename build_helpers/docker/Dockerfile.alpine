@@ -7,7 +7,7 @@ FROM alpine:3 as builder
 RUN apk add bash boost-dev cmake curl-dev gcc g++ git libaio-dev make \
         numactl-dev ncurses ncurses-dev sudo
 
-RUN cd /root && git clone https://github.com/esnet/elbencho.git && \
+RUN cd /root && git clone --branch v3.0-7 --single-branch https://github.com/esnet/elbencho.git && \
     cd elbencho && \
     make BACKTRACE_SUPPORT=0 S3_SUPPORT=1 USE_MIMALLOC=1 -j "$(nproc)" && \
     make install
