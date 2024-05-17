@@ -390,9 +390,7 @@ extract_results_for_plotting()
         ((i++))
     done
     # Join the p"$i" files into a single output file, using the default \t
-    # The [0-9] regex prevents hostnames with a leading p from messing up
-    # the resulting file.
-    paste "$output_dir"/p[0-9]* > "$pasted_file"
+    paste "$output_dir"/p_write* > "$pasted_file"
     ensure_file_exists "$pasted_file"
     if [[ "$readwrite" = "r" ]]; then
 	paste "$output_dir"/p_read* > "$pasted_rfile"
